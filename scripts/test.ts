@@ -31,7 +31,7 @@ import { parseBingHtml, parseDuckDuckGoHtml } from "../src/lib/chordSources/webS
 import { collectSources } from "../src/lib/chordSources/providers";
 import { analyzeAudio } from "../src/lib/audioAnalysis/analyze";
 import { extractVideoId } from "../src/lib/youtube";
-import type { AnalyzeDebug, AnalyzeResult } from "../src/lib/types";
+import type { AnalyzeDebug, AnalyzeResult, AudioChordCandidate } from "../src/lib/types";
 
 let passed = 0;
 let failed = 0;
@@ -504,6 +504,161 @@ async function testAudioAnalysis() {
   ok(audioOnly.timeline.every((e) => e.source === "audio-analysis"), "audio only -> source label");
 }
 
+// ---- 実音源に近い条件での耐性テスト ----
+// 単純な正弦波の合成だけでは「実際のJ-POP音源で正答率が低い」問題を検証できないため、
+// 半小節ごとのコード変化・打楽器的ノイズ・干渉するメロディを模した信号で検証する。
+
+/** 決定的な擬似乱数 (打楽器ノイズの再現性のため) */
+function mulberry32(seed: number) {
+  return function () {
+    seed |= 0;
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** 拍ごとに減衰する打楽器的クリック (キック+ハイハット) を信号に加算する */
+function addPercussiveClicks(samples: Float32Array, sr: number, beatSec: number, totalSec: number) {
+  const rand = mulberry32(42);
+  const tau = 0.02; // 20ms減衰 (キック/ハイハット的な短い過渡成分)
+  const clickLen = Math.floor(sr * tau * 6);
+  const addClick = (tHit: number, amp: number) => {
+    const startIdx = Math.floor(tHit * sr);
+    for (let k = 0; k < clickLen; k++) {
+      const idx = startIdx + k;
+      if (idx < 0 || idx >= samples.length) continue;
+      const decay = Math.exp(-k / (tau * sr));
+      samples[idx] += (rand() * 2 - 1) * decay * amp;
+    }
+  };
+  // 振幅はコード信号のピーク (4音重ね/4・全体スケール0.5 ≒ 0.125) に対して
+  // ドラムが十分主張するが破壊し尽くしはしない、一般的なポップスのミックス比を想定
+  for (let t = 0; t < totalSec; t += beatSec) addClick(t, 0.2); // キック: 毎拍
+  for (let t = beatSec / 2; t < totalSec; t += beatSec) addClick(t, 0.1); // ハイハット: 裏拍
+}
+
+/** コード進行 + オプションでノイズ/メロディを重ねた合成音声を作る */
+function synthChordSignal(opts: {
+  sr: number;
+  bpm: number;
+  totalSec: number;
+  chordAt: (t: number) => number[];
+  addClicks?: boolean;
+  addMelody?: boolean;
+}): Float32Array {
+  const { sr, bpm, totalSec, chordAt } = opts;
+  const n = Math.floor(sr * totalSec);
+  const samples = new Float32Array(n);
+  const beatSec = 60 / bpm;
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    const freqs = chordAt(t);
+    // 持続的なパッド/ピアノを想定: 常に一定以上のサステインを保ちつつ、
+    // 拍頭でわずかにアタックが立つ (完全に減衰しきる打撃音モデルは非現実的なため)
+    const env = 0.55 + 0.45 * Math.exp(-3 * ((t % beatSec) / beatSec));
+    let v = 0;
+    for (const f of freqs) v += Math.sin(2 * Math.PI * f * t);
+    v = freqs.length ? (v / freqs.length) * env * 0.5 : 0;
+    if (opts.addMelody) {
+      // ボーカルを想定した、コードトーンと衝突しやすい非構成音の経過音
+      // (歌は常に鳴りっぱなしではなく音符ごとに区切られるのが自然なため、
+      //  音符の切れ目でわずかに音量が落ちるエンベロープを与える)
+      const scale = [0, 2, 4, 5, 9];
+      const noteIdx = Math.floor(t / 0.5);
+      const step = scale[noteIdx % scale.length];
+      const melodyFreq = 440 * Math.pow(2, (step + 5) / 12);
+      const notePhase = (t / 0.5) % 1;
+      const melodyEnv = 0.7 + 0.3 * Math.exp(-6 * notePhase);
+      v += Math.sin(2 * Math.PI * melodyFreq * t) * 0.22 * melodyEnv;
+    }
+    samples[i] = v;
+  }
+  if (opts.addClicks) addPercussiveClicks(samples, sr, beatSec, totalSec);
+  return samples;
+}
+
+function findChordAt(chords: AudioChordCandidate[], t: number): AudioChordCandidate | undefined {
+  return chords.find((c) => t >= c.start && t < c.end);
+}
+
+/** 検出結果を一定間隔でサンプリングし、正解ルート/長短と一致する割合を返す */
+function gradeAccuracy(
+  chords: AudioChordCandidate[],
+  truthAt: (t: number) => { root: string; minor: boolean },
+  totalSec: number,
+  margin = 0.1
+): number {
+  let correct = 0;
+  let total = 0;
+  for (let t = margin; t < totalSec - margin; t += 0.05) {
+    total++;
+    const truth = truthAt(t);
+    const found = findChordAt(chords, t);
+    if (found && found.root === truth.root && /^m/.test(found.quality ?? "") === truth.minor) correct++;
+  }
+  return total > 0 ? correct / total : 0;
+}
+
+const CHORD_FREQS: Record<string, number[]> = {
+  C: [130.81, 164.81, 196.0, 261.63],
+  G: [98.0, 123.47, 146.83, 196.0],
+  Am: [110.0, 130.81, 164.81, 220.0],
+  F: [174.61, 220.0, 261.63, 349.23],
+};
+const CHORD_ROOT: Record<string, { root: string; minor: boolean }> = {
+  C: { root: "C", minor: false },
+  G: { root: "G", minor: false },
+  Am: { root: "A", minor: true },
+  F: { root: "F", minor: false },
+};
+
+async function testRealisticAudioConditions() {
+  const sr = 11025;
+  const bpm = 120;
+  const totalSec = 24;
+
+  // ---- 半小節 (2拍) ごとにコードが変わる曲での追従性 ----
+  // 旧実装は小節全体のchromaを平均していたため、この条件では原理的に検出不能だった
+  {
+    const sequence = ["C", "G", "Am", "F"];
+    const segSec = 1.0; // 120BPMの2拍 = 半小節
+    const nameAt = (t: number) => sequence[Math.floor(t / segSec) % sequence.length];
+    const samples = synthChordSignal({ sr, bpm, totalSec, chordAt: (t) => CHORD_FREQS[nameAt(t)] });
+    const result = await analyzeAudio(samples, sr);
+    const acc = gradeAccuracy(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec);
+    ok(acc >= 0.75, `half-bar chord changes tracked (accuracy ${(acc * 100).toFixed(0)}%)`);
+    ok(result.chords.length >= 12, `half-bar changes produce enough segments (${result.chords.length})`);
+  }
+
+  // ---- 打楽器的ノイズ (キック+ハイハット) が乗っても和声認識が崩れないこと ----
+  {
+    const sequence = ["C", "F"];
+    const barSec = 2.0;
+    const nameAt = (t: number) => sequence[Math.floor(t / barSec) % sequence.length];
+    const samples = synthChordSignal({
+      sr, bpm, totalSec, chordAt: (t) => CHORD_FREQS[nameAt(t)], addClicks: true,
+    });
+    const result = await analyzeAudio(samples, sr);
+    const acc = gradeAccuracy(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec, 0.15);
+    ok(acc >= 0.8, `chord detection robust to percussive noise (accuracy ${(acc * 100).toFixed(0)}%)`);
+  }
+
+  // ---- 干渉する (非コードトーンの) メロディが乗っていてもルートが概ね正しいこと ----
+  {
+    const sequence = ["C", "F"];
+    const barSec = 2.0;
+    const nameAt = (t: number) => sequence[Math.floor(t / barSec) % sequence.length];
+    const samples = synthChordSignal({
+      sr, bpm, totalSec, chordAt: (t) => CHORD_FREQS[nameAt(t)], addMelody: true,
+    });
+    const result = await analyzeAudio(samples, sr);
+    const acc = gradeAccuracy(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec, 0.15);
+    ok(acc >= 0.6, `chord root survives interfering melody (accuracy ${(acc * 100).toFixed(0)}%)`);
+  }
+}
+
 Promise.all([
   testSearchResilience().catch((e) => {
     failed++;
@@ -512,6 +667,10 @@ Promise.all([
   testAudioAnalysis().catch((e) => {
     failed++;
     console.error("✗ audio analysis threw:", e);
+  }),
+  testRealisticAudioConditions().catch((e) => {
+    failed++;
+    console.error("✗ realistic audio conditions threw:", e);
   }),
 ]).finally(() => {
   console.log(`\n${passed} passed, ${failed} failed`);
