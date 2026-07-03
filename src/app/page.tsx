@@ -746,6 +746,9 @@ export default function Home() {
                   {project.debug.searches.map((s, i) => (
                     <li key={i}>
                       [{s.provider}] <code>{s.query}</code> → {s.hitCount}件
+                      {s.status !== undefined && <span className="muted"> (HTTP {s.status}{s.bytes ? `, ${s.bytes}B` : ""})</span>}
+                      {s.usedFallback && <span className="muted"> [汎用抽出にフォールバック]</span>}
+                      {s.blockedLike && <span className="debug-err"> ⚠ アクセス拒否/CAPTCHAの疑い</span>}
                       {s.error && <span className="debug-err"> エラー: {s.error}</span>}
                     </li>
                   ))}

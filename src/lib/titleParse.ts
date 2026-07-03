@@ -29,6 +29,13 @@ const NOISE_PATTERNS: RegExp[] = [
   /主題歌|挿入歌|イメージソング/g,
   /ドラマ[「『][^」』]*[」』]/g,
   /映画[「『][^」』]*[」』]/g,
+  // リリース情報 (アーティスト名に混入して検索クエリを壊しやすいため必ず除去)
+  /\d+(st|nd|rd|th)\s*(mini[\s-]?album|full[\s-]?album|album|single|maxi[\s-]?single|ep)\b/gi,
+  /(第)?\d+(枚目)?\s*(シングル|アルバム|ミニアルバム|フルアルバム)/g,
+  /配信中|先行配信|配信限定|数量限定盤?|初回限定盤|通常盤|完全生産限定盤|Blu-?ray付|DVD付/gi,
+  // 読み仮名の注記 (「≠ME（ノットイコールミー）」のようにアーティスト名直後に付くカタカナ/ひらがな読み)
+  // 括弧の中身がカタカナ・ひらがな・長音のみの場合は読み仮名とみなし、括弧ごと除去する
+  /[（(][぀-ゟ゠-ヿ]{2,}[)）]/g,
 ];
 
 /** チャンネル名から除去する語 */
@@ -56,7 +63,12 @@ function cleanup(s: string): string {
 }
 
 export function cleanChannelName(channel: string): string {
-  return cleanup(channel.replace(CHANNEL_NOISE, " "));
+  return cleanup(removeNoise(channel.replace(CHANNEL_NOISE, " ")));
+}
+
+/** ユーザーが手入力した曲名・アーティスト名からもノイズ (読み仮名注記・リリース情報等) を除去する */
+export function cleanUserInput(s: string): string {
+  return cleanup(removeNoise(s));
 }
 
 /**

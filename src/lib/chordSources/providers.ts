@@ -7,10 +7,29 @@
 // 丸ごとの保存・再配布はしない (保存するのはコード名の列と出典URLのみ)
 
 import type { AnalyzeDebug, ExternalSourceResult, SongGuess } from "../types";
-import { fetchText, decodeEntities } from "./fetchUtil";
+import { fetchText, decodeEntities, type FetchDiag } from "./fetchUtil";
 import { extractChordsDetailed, extractPageMeta } from "./extract";
-import { SEARCH_ENGINES, type SearchHit } from "./webSearch";
+import { SEARCH_ENGINES, type SearchDiag, type SearchHit } from "./webSearch";
 import { normalizeForMatch, scoreHit } from "./scoring";
+
+function pushSearchDebug(
+  debug: AnalyzeDebug,
+  provider: string,
+  query: string,
+  hitCount: number,
+  diag?: FetchDiag & { usedFallback?: boolean }
+): void {
+  debug.searches.push({
+    provider,
+    query,
+    hitCount,
+    error: diag && !diag.ok ? diag.error ?? `HTTP ${diag.status}` : undefined,
+    status: diag?.status,
+    bytes: diag?.bytes,
+    blockedLike: diag?.blockedLike,
+    usedFallback: diag?.usedFallback,
+  });
+}
 
 const MAX_FETCH_PAGES = 6;
 const MAX_PER_DOMAIN = 2;
@@ -38,9 +57,17 @@ export async function fetchChordPage(
   artist: string,
   debug?: AnalyzeDebug
 ): Promise<ExternalSourceResult | null> {
-  const html = await fetchText(url);
+  const diag: FetchDiag = { ok: false };
+  const html = await fetchText(url, 8000, diag);
   if (!html) {
-    debug?.fetched.push({ url, provider, ok: false, chordCount: 0, note: "取得失敗" });
+    debug?.fetched.push({
+      url, provider, ok: false, chordCount: 0,
+      note: diag.error ? `取得失敗 (${diag.error})` : `取得失敗 (HTTP ${diag.status})`,
+    });
+    return null;
+  }
+  if (diag.blockedLike) {
+    debug?.fetched.push({ url, provider, ok: false, chordCount: 0, note: "アクセス拒否/CAPTCHAの可能性" });
     return null;
   }
   const { chords, strategy } = extractChordsDetailed(html);
@@ -71,6 +98,27 @@ export async function fetchChordPage(
   };
 }
 
+/** HTMLから <a href="pattern">title</a> 形式のリンクを広く拾う (サイト構造変化に強い汎用抽出) */
+function extractLinksMatching(
+  html: string,
+  hrefRe: RegExp,
+  resolveUrl: (raw: string) => string,
+  max = 6
+): { url: string; title: string }[] {
+  const out: { url: string; title: string }[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  const re = new RegExp(hrefRe.source, hrefRe.flags.includes("g") ? hrefRe.flags : hrefRe.flags + "g");
+  while ((m = re.exec(html)) && out.length < max) {
+    const url = resolveUrl(decodeEntities(m[1]));
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const title = decodeEntities((m[2] ?? "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    out.push({ url, title });
+  }
+  return out;
+}
+
 /** ChordWiki: サイト内検索 → 上位ページのURL候補 */
 async function searchChordWikiDirect(
   song: string,
@@ -79,25 +127,25 @@ async function searchChordWikiDirect(
 ): Promise<SearchHit[]> {
   const q = `${song} ${artist}`.trim();
   const searchUrl = `https://ja.chordwiki.org/wiki.cgi?c=search&q=${encodeURIComponent(q)}`;
-  const html = await fetchText(searchUrl);
+  const diag: FetchDiag = { ok: false };
+  const html = await fetchText(searchUrl, 8000, diag);
   if (!html) {
-    debug.searches.push({ provider: "ChordWiki直接", query: q, hitCount: 0, error: "取得失敗" });
+    pushSearchDebug(debug, "ChordWiki直接", q, 0, diag);
     return [];
   }
-  const hits: SearchHit[] = [];
-  const re = /<a[^>]*href="(\/wiki\/[^"]+|\/wiki\.cgi\?t=[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) && hits.length < 4) {
-    const title = decodeEntities(m[2].replace(/<[^>]+>/g, "")).trim();
-    if (!title) continue;
-    hits.push({
-      url: `https://ja.chordwiki.org${decodeEntities(m[1])}`,
-      title: `${title} - ChordWiki`,
-      snippet: "",
-      searchProvider: "ChordWiki直接",
-    });
-  }
-  debug.searches.push({ provider: "ChordWiki直接", query: q, hitCount: hits.length });
+  // /wiki/曲名 または wiki.cgi?... へのリンクを広く拾う (t=以外のパラメータ形式にも対応)
+  const links = extractLinksMatching(
+    html,
+    /<a[^>]*href="(\/wiki\/[^"]+|\/wiki\.cgi\?[^"]+)"[^>]*>([\s\S]*?)<\/a>/,
+    (raw) => `https://ja.chordwiki.org${raw}`
+  ).filter((l) => !/c=search|c=edit|c=diff|c=new/.test(l.url));
+  const hits: SearchHit[] = links.map((l) => ({
+    url: l.url,
+    title: l.title ? `${l.title} - ChordWiki` : "ChordWiki",
+    snippet: "",
+    searchProvider: "ChordWiki直接",
+  }));
+  pushSearchDebug(debug, "ChordWiki直接", q, hits.length, diag);
   return hits;
 }
 
@@ -109,25 +157,34 @@ async function searchUfretDirect(
 ): Promise<SearchHit[]> {
   const q = `${song} ${artist}`.trim();
   const searchUrl = `https://www.ufret.jp/search.php?key=${encodeURIComponent(q)}`;
-  const html = await fetchText(searchUrl);
+  const diag: FetchDiag = { ok: false };
+  const html = await fetchText(searchUrl, 8000, diag);
   if (!html) {
-    debug.searches.push({ provider: "U-FRET直接", query: q, hitCount: 0, error: "取得失敗" });
+    pushSearchDebug(debug, "U-FRET直接", q, 0, diag);
     return [];
   }
-  const hits: SearchHit[] = [];
-  // 曲ページリンク: song.php?data=NNNN
-  const re = /<a[^>]*href="((?:https?:\/\/www\.ufret\.jp\/)?song\.php\?data=\d+[^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
-  const seen = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) && hits.length < 4) {
-    let url = decodeEntities(m[1]);
-    if (!url.startsWith("http")) url = `https://www.ufret.jp/${url}`;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    const title = decodeEntities(m[2].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
-    hits.push({ url, title: `${title} - U-FRET`, snippet: "", searchProvider: "U-FRET直接" });
+  const resolve = (raw: string) => (raw.startsWith("http") ? raw : `https://www.ufret.jp/${raw.replace(/^\//, "")}`);
+  // 曲ページリンク (song.php?data=NNNN が基本形だが、サイト改修に備えてsong系パスも広く拾う)
+  let links = extractLinksMatching(
+    html,
+    /<a[^>]*href="((?:https?:\/\/www\.ufret\.jp\/)?song\.php\?data=\d+[^"]*)"[^>]*>([\s\S]*?)<\/a>/,
+    resolve
+  );
+  if (links.length === 0) {
+    // フォールバック: /song 系パスへのリンクを広く拾う (URL構造が変わった場合の保険)
+    links = extractLinksMatching(
+      html,
+      /<a[^>]*href="((?:https?:\/\/www\.ufret\.jp)?\/[^"]*song[^"]*)"[^>]*>([\s\S]*?)<\/a>/i,
+      resolve
+    ).filter((l) => !/search\.php|\/song\/?$/.test(l.url));
   }
-  debug.searches.push({ provider: "U-FRET直接", query: q, hitCount: hits.length });
+  const hits: SearchHit[] = links.map((l) => ({
+    url: l.url,
+    title: l.title ? `${l.title} - U-FRET` : "U-FRET",
+    snippet: "",
+    searchProvider: "U-FRET直接",
+  }));
+  pushSearchDebug(debug, "U-FRET直接", q, hits.length, diag);
   return hits;
 }
 
@@ -157,17 +214,18 @@ export async function collectSources(
   outer: for (const query of queries.slice(0, 5)) {
     for (const engine of SEARCH_ENGINES) {
       if (deadline()) break outer;
+      const diag: SearchDiag = { ok: false };
       try {
-        const hits = await engine.run(query);
+        const hits = await engine.run(query, diag);
         if (hits === null) {
-          debug.searches.push({ provider: engine.name, query, hitCount: 0, error: "取得失敗" });
+          pushSearchDebug(debug, engine.name, query, 0, diag);
         } else {
-          debug.searches.push({ provider: engine.name, query, hitCount: hits.length });
+          pushSearchDebug(debug, engine.name, query, hits.length, diag);
           allHits.push(...hits);
         }
       } catch (e) {
-        debug.searches.push({
-          provider: engine.name, query, hitCount: 0,
+        pushSearchDebug(debug, engine.name, query, 0, {
+          ok: false,
           error: e instanceof Error ? e.message : "error",
         });
       }

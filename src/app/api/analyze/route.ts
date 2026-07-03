@@ -7,7 +7,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { extractVideoId, fetchVideoInfo } from "@/lib/youtube";
-import { buildQueries, guessSong } from "@/lib/titleParse";
+import { buildQueries, cleanUserInput, guessSong } from "@/lib/titleParse";
 import { collectSources } from "@/lib/chordSources/providers";
 import { buildConsensus } from "@/lib/chordSources/consensus";
 import type { AnalyzeDebug, AnalyzeResult, SongGuess } from "@/lib/types";
@@ -38,8 +38,8 @@ export async function POST(req: NextRequest) {
   // 2. 曲名・アーティスト名推定 (ユーザーによる手動指定があれば最優先)
   let songGuess: SongGuess;
   if (body.titleOverride?.trim()) {
-    const title = body.titleOverride.trim();
-    const artist = body.artistOverride?.trim() ?? "";
+    const title = cleanUserInput(body.titleOverride);
+    const artist = body.artistOverride?.trim() ? cleanUserInput(body.artistOverride) : "";
     songGuess = { title, artist, confidence: 1, queries: buildQueries(title, artist) };
   } else {
     songGuess = guessSong(videoTitle, video.channelName);
