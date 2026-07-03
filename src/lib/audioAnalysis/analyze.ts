@@ -3,14 +3,36 @@
 // 完璧な自動採譜は目的ではない。少なくともBPMと拍・小節グリッドを取り、
 // コード候補は「ユーザーがすぐ直せる叩き台」の品質を目指す。
 // 純粋なTS実装 (Web Audio非依存) なので、Nodeでのテストとブラウザ実行を共用できる。
+//
+// 実音源 (ドラム・ボーカル・残響を含むミックス) での精度を上げるため、以下を行う:
+// - 低音域でも半音を区別できるよう大きめのFFT (4096) を使う
+// - ビン周波数が2つのピッチクラスの間にある場合は按分して両方に加算する
+//   (低音域ほどビン幅が半音間隔に対して相対的に広いため、丸め誤差を減らす)
+// - 振幅の対数圧縮 (log1p) でボーカルや打楽器の突出したピークの影響を弱める
+// - 時間方向のメディアンフィルタでドラム等の瞬間的な非調性成分を抑える
+//   (harmonic-percussive分離の簡易近似)
+// - 小節ではなく拍単位でコードを推定し、同じコードが続く区間だけをまとめる
+//   (半小節・1拍でコードが変わる曲でも追従できるようにする)
+// - メジャー/マイナー3和音だけでなく7th/6th/sus/dim/augもテンプレートに含める
 
 import { FFT, hannWindow } from "./fft";
 import type { AudioAnalysisResult, AudioChordCandidate, BeatGrid } from "../types";
 
-const FRAME_SIZE = 2048;
+const CHROMA_FFT_SIZE = 4096;
 const HOP_SIZE = 512;
 const MIN_BPM = 60;
 const MAX_BPM = 200;
+
+/** chroma集計に使う周波数帯。上限を4kHzではなく2.5kHzに抑え、
+ *  ボーカルの高次倍音やシンバル等の非調性ノイズの混入を減らす */
+const CHROMA_MIN_FREQ = 55;
+const CHROMA_MAX_FREQ = 2500;
+const BASS_MAX_FREQ = 260;
+
+/** 打楽器抑制 (簡易HPSS) の窓半径。時間方向は持続音の平滑化、周波数方向は
+ *  「特定ビンだけ突出=調性音」「広帯域にわたって同程度=打楽器音」を判別するために使う */
+const MEDIAN_RADIUS_TIME = 4;
+const MEDIAN_RADIUS_FREQ = 6;
 
 const PC_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -43,12 +65,12 @@ export async function analyzeAudio(
 ): Promise<AudioAnalysisResult> {
   const duration = samples.length / sampleRate;
   const frames = await computeFrames(samples, sampleRate, opts);
-  opts.onProgress?.(0.7);
+  opts.onProgress?.(0.85);
 
   const { bpm, periodFrames, acfProminence } = estimateTempo(frames.novelty, frames.hopSec);
   const { beats, phaseContrast } = findBeats(frames, periodFrames, duration);
   const { downbeats, firstDownbeat } = findDownbeats(beats, frames);
-  opts.onProgress?.(0.85);
+  opts.onProgress?.(0.92);
 
   const gridConfidence = clamp01(((phaseContrast - 1) * 1.6 + (acfProminence - 1.1) * 0.8) / 2);
   const grid: BeatGrid = {
@@ -60,76 +82,178 @@ export async function analyzeAudio(
     source: "audio",
   };
 
-  const chords = detectChords(grid, frames, duration);
+  const chords = detectChordsPerBeat(grid, frames, duration);
   opts.onProgress?.(1);
 
   return { grid, chords, duration };
 }
 
-/** STFTでフレームごとの novelty / chroma / bass chroma / energy を計算 */
+/**
+ * STFTを複数パスで処理してフレームごとの novelty / chroma / bass chroma / energy を計算する。
+ * 1. 全ビンの振幅からnovelty/energyを求めつつ、対象帯域ビンの振幅時系列を保存する
+ * 2. 簡易HPSS (harmonic-percussive分離) で打楽器的な瞬間成分を抑える:
+ *    - 時間方向メディアン → 持続音を残す「調性成分」の目安 (harmonicEnhanced)
+ *    - 周波数方向メディアン → 広帯域に均される「打楽器成分」の目安 (percussiveEnhanced)
+ *    - 両者の二乗比からソフトマスクを作り元の振幅に掛けることで、
+ *      大きめのFFT窓 (周波数分解能重視) を使っても打楽器の瞬間的なエネルギーが
+ *      多数のフレームに滲み出す問題を、フレーム単位の「尖り具合」で判別して抑える
+ * 3. フィルタ後の振幅を対数圧縮し、隣接2ピッチクラスへ按分してchroma/bassChromaを作る
+ */
 async function computeFrames(
   samples: Float32Array,
   sampleRate: number,
   opts: AnalyzeOptions
 ): Promise<Frames> {
-  const fft = new FFT(FRAME_SIZE);
-  const window = hannWindow(FRAME_SIZE);
-  const nFrames = Math.max(0, Math.floor((samples.length - FRAME_SIZE) / HOP_SIZE) + 1);
+  const N = CHROMA_FFT_SIZE;
+  const fft = new FFT(N);
+  const window = hannWindow(N);
+  const nFrames = Math.max(0, Math.floor((samples.length - N) / HOP_SIZE) + 1);
   const hopSec = HOP_SIZE / sampleRate;
+  const nBins = N / 2;
 
+  // ビンごとの対象帯域判定と、按分先の2ピッチクラス・重みを事前計算する
+  const binPcA = new Int8Array(nBins).fill(-1);
+  const binWA = new Float32Array(nBins);
+  const binPcB = new Int8Array(nBins).fill(-1);
+  const binWB = new Float32Array(nBins);
+  const binIsBass = new Uint8Array(nBins);
+  const inRangeBins: number[] = [];
+  for (let k = 1; k < nBins; k++) {
+    const freq = (k * sampleRate) / N;
+    if (freq < CHROMA_MIN_FREQ || freq > CHROMA_MAX_FREQ) continue;
+    inRangeBins.push(k);
+    if (freq <= BASS_MAX_FREQ) binIsBass[k] = 1;
+    const midi = 69 + 12 * Math.log2(freq / 440);
+    const pcFloat = ((midi % 12) + 12) % 12;
+    const lower = Math.floor(pcFloat);
+    const frac = pcFloat - lower;
+    binPcA[k] = lower % 12;
+    binWA[k] = 1 - frac;
+    binPcB[k] = (lower + 1) % 12;
+    binWB[k] = frac;
+  }
+
+  // --- Pass 1: STFT ---
+  const magByBin: Float32Array[] = inRangeBins.map(() => new Float32Array(nFrames));
   const novelty = new Float32Array(nFrames);
   const energy = new Float32Array(nFrames);
-  const chroma: Float32Array[] = [];
-  const bassChroma: Float32Array[] = [];
 
-  const buf = new Float32Array(FRAME_SIZE);
-  const re = new Float32Array(FRAME_SIZE);
-  const im = new Float32Array(FRAME_SIZE);
-  const power = new Float32Array(FRAME_SIZE / 2);
-  let prevMag = new Float32Array(FRAME_SIZE / 2);
-  const curMag = new Float32Array(FRAME_SIZE / 2);
-
-  // 周波数ビン -> ピッチクラス対応表 (55Hz〜4kHzをchroma、55〜260Hzをbassに)
-  const binPc = new Int8Array(FRAME_SIZE / 2).fill(-1);
-  const binIsBass = new Uint8Array(FRAME_SIZE / 2);
-  for (let k = 1; k < FRAME_SIZE / 2; k++) {
-    const freq = (k * sampleRate) / FRAME_SIZE;
-    if (freq < 55 || freq > 4000) continue;
-    const midi = 69 + 12 * Math.log2(freq / 440);
-    binPc[k] = ((Math.round(midi) % 12) + 12) % 12;
-    if (freq <= 260) binIsBass[k] = 1;
-  }
+  const buf = new Float32Array(N);
+  const re = new Float32Array(N);
+  const im = new Float32Array(N);
+  const power = new Float32Array(nBins);
+  const prevMag = new Float32Array(nBins);
+  const curMag = new Float32Array(nBins);
 
   for (let f = 0; f < nFrames; f++) {
     const offset = f * HOP_SIZE;
-    for (let i = 0; i < FRAME_SIZE; i++) buf[i] = samples[offset + i] * window[i];
+    for (let i = 0; i < N; i++) buf[i] = samples[offset + i] * window[i];
     fft.powerSpectrum(buf, re, im, power);
 
     let flux = 0;
     let en = 0;
-    const ch = new Float32Array(12);
-    const bch = new Float32Array(12);
-    for (let k = 1; k < FRAME_SIZE / 2; k++) {
+    for (let k = 1; k < nBins; k++) {
       const mag = Math.sqrt(power[k]);
       curMag[k] = mag;
       en += power[k];
-      const d = mag - prevMag[k];
+      // 対数圧縮したフラックス: 大きな打楽器的トランジェントに支配されにくくする
+      const d = Math.log1p(mag) - Math.log1p(prevMag[k]);
       if (d > 0) flux += d;
-      const pc = binPc[k];
-      if (pc >= 0) {
-        ch[pc] += mag;
-        if (binIsBass[k]) bch[pc] += mag;
-      }
+      prevMag[k] = mag;
     }
     novelty[f] = flux;
     energy[f] = en;
-    chroma.push(ch);
-    bassChroma.push(bch);
-    // swap
-    prevMag.set(curMag);
 
-    if (f % 250 === 249) {
-      opts.onProgress?.(0.7 * (f / nFrames));
+    for (let idx = 0; idx < inRangeBins.length; idx++) {
+      magByBin[idx][f] = curMag[inRangeBins[idx]];
+    }
+
+    if (f % 200 === 199) {
+      opts.onProgress?.(0.5 * (f / nFrames));
+      if (opts.yieldFn) await opts.yieldFn();
+    }
+  }
+
+  // --- Pass 2a: 時間方向メディアン (harmonic-enhanced: 持続音を残す) ---
+  const nBinsInRange = inRangeBins.length;
+  const harmEnh: Float32Array[] = inRangeBins.map(() => new Float32Array(nFrames));
+  {
+    const win = new Float32Array(MEDIAN_RADIUS_TIME * 2 + 1);
+    for (let idx = 0; idx < nBinsInRange; idx++) {
+      const src = magByBin[idx];
+      const dst = harmEnh[idx];
+      for (let f = 0; f < nFrames; f++) {
+        const lo = Math.max(0, f - MEDIAN_RADIUS_TIME);
+        const hi = Math.min(nFrames - 1, f + MEDIAN_RADIUS_TIME);
+        const len = hi - lo + 1;
+        for (let i = 0; i < len; i++) win[i] = src[lo + i];
+        dst[f] = medianOf(win, len);
+      }
+      if (idx % 100 === 99) {
+        opts.onProgress?.(0.5 + 0.15 * (idx / nBinsInRange));
+        if (opts.yieldFn) await opts.yieldFn();
+      }
+    }
+  }
+
+  // --- Pass 2b: 周波数方向メディアン (percussive-enhanced: 広帯域成分を残す) ---
+  const percEnh: Float32Array[] = inRangeBins.map(() => new Float32Array(nFrames));
+  {
+    const win = new Float32Array(MEDIAN_RADIUS_FREQ * 2 + 1);
+    for (let f = 0; f < nFrames; f++) {
+      for (let idx = 0; idx < nBinsInRange; idx++) {
+        const lo = Math.max(0, idx - MEDIAN_RADIUS_FREQ);
+        const hi = Math.min(nBinsInRange - 1, idx + MEDIAN_RADIUS_FREQ);
+        const len = hi - lo + 1;
+        for (let i = 0; i < len; i++) win[i] = magByBin[lo + i][f];
+        percEnh[idx][f] = medianOf(win, len);
+      }
+      if (f % 200 === 199) {
+        opts.onProgress?.(0.65 + 0.15 * (f / nFrames));
+        if (opts.yieldFn) await opts.yieldFn();
+      }
+    }
+  }
+
+  // --- Pass 2c: ソフトマスクを合成して元の振幅に適用 ---
+  // 特定ビンだけ突出していれば調性音 (harmonic側が相対的に大きい)、
+  // 広帯域にわたって同程度なら打楽器音 (percussive側が相対的に大きい) とみなす
+  const filtered: Float32Array[] = inRangeBins.map(() => new Float32Array(nFrames));
+  for (let idx = 0; idx < nBinsInRange; idx++) {
+    const orig = magByBin[idx];
+    const h = harmEnh[idx];
+    const p = percEnh[idx];
+    const dst = filtered[idx];
+    for (let f = 0; f < nFrames; f++) {
+      const h2 = h[f] * h[f];
+      const p2 = p[f] * p[f];
+      const maskH = h2 + p2 > 1e-12 ? h2 / (h2 + p2) : 0.5;
+      dst[f] = orig[f] * maskH;
+    }
+  }
+
+  // --- Pass 3: 対数圧縮 + 2ピッチクラスへの按分でchroma/bassChromaを構築 ---
+  const chroma: Float32Array[] = Array.from({ length: nFrames }, () => new Float32Array(12));
+  const bassChroma: Float32Array[] = Array.from({ length: nFrames }, () => new Float32Array(12));
+  for (let idx = 0; idx < inRangeBins.length; idx++) {
+    const k = inRangeBins[idx];
+    const pcA = binPcA[k];
+    const wA = binWA[k];
+    const pcB = binPcB[k];
+    const wB = binWB[k];
+    const isBass = binIsBass[k] === 1;
+    const src = filtered[idx];
+    for (let f = 0; f < nFrames; f++) {
+      const v = Math.log1p(src[f]);
+      chroma[f][pcA] += v * wA;
+      chroma[f][pcB] += v * wB;
+      if (isBass) {
+        bassChroma[f][pcA] += v * wA;
+        bassChroma[f][pcB] += v * wB;
+      }
+    }
+    if (idx % 100 === 99) {
+      opts.onProgress?.(0.75 + 0.1 * (idx / inRangeBins.length));
       if (opts.yieldFn) await opts.yieldFn();
     }
   }
@@ -140,8 +264,22 @@ async function computeFrames(
     bassChroma,
     energy,
     hopSec,
-    centerOffset: FRAME_SIZE / 2 / sampleRate,
+    centerOffset: N / 2 / sampleRate,
   };
+}
+
+/** 固定長の小さな窓を挿入ソートして中央値を取る (メモリ確保なし) */
+function medianOf(win: Float32Array, len: number): number {
+  for (let i = 1; i < len; i++) {
+    const v = win[i];
+    let j = i - 1;
+    while (j >= 0 && win[j] > v) {
+      win[j + 1] = win[j];
+      j--;
+    }
+    win[j + 1] = v;
+  }
+  return win[len >> 1];
 }
 
 /** noveltyの自己相関からBPMを推定する */
@@ -314,10 +452,103 @@ function norm(v: Float32Array): number {
   return Math.sqrt(s);
 }
 
-/** 小節ごとのchromaをメジャー/マイナートライアドのテンプレートと照合してコード候補を出す */
-function detectChords(grid: BeatGrid, frames: Frames, duration: number): AudioChordCandidate[] {
-  const bars = grid.downbeats;
-  if (bars.length < 2) return [];
+/** コードテンプレート: ルートからの半音インターバルと、音ごとの重み (ルートを最も重視) */
+interface ChordTemplate {
+  quality: string;
+  intervals: number[];
+  weights: number[];
+}
+
+const CHORD_TEMPLATES: ChordTemplate[] = [
+  { quality: "", intervals: [0, 4, 7], weights: [1.0, 0.85, 0.75] },
+  { quality: "m", intervals: [0, 3, 7], weights: [1.0, 0.85, 0.75] },
+  { quality: "7", intervals: [0, 4, 7, 10], weights: [1.0, 0.85, 0.75, 0.55] },
+  { quality: "m7", intervals: [0, 3, 7, 10], weights: [1.0, 0.85, 0.75, 0.55] },
+  { quality: "maj7", intervals: [0, 4, 7, 11], weights: [1.0, 0.85, 0.75, 0.5] },
+  { quality: "6", intervals: [0, 4, 7, 9], weights: [1.0, 0.85, 0.75, 0.5] },
+  { quality: "m6", intervals: [0, 3, 7, 9], weights: [1.0, 0.85, 0.75, 0.5] },
+  { quality: "sus4", intervals: [0, 5, 7], weights: [1.0, 0.8, 0.75] },
+  { quality: "sus2", intervals: [0, 2, 7], weights: [1.0, 0.8, 0.75] },
+  { quality: "dim", intervals: [0, 3, 6], weights: [1.0, 0.8, 0.7] },
+  { quality: "aug", intervals: [0, 4, 8], weights: [1.0, 0.8, 0.7] },
+];
+
+interface ChordMatch {
+  name: string;
+  rootPc: number;
+  quality: string;
+  tonePcs: number[];
+  confidence: number;
+}
+
+/**
+ * 全12ルート×全テンプレートを照合し、最良のコードを返す。
+ * テンプレートごとに音数が違う (3和音 vs 4和音) ため、合計ではなく平均で
+ * スコアリングし、音数が多いテンプレートが不当に有利にならないようにする。
+ */
+function matchChord(chroma: Float32Array): ChordMatch | null {
+  const n = norm(chroma);
+  if (n === 0) return null;
+  const c = new Float32Array(12);
+  for (let i = 0; i < 12; i++) c[i] = chroma[i] / n;
+
+  let best = { score: -Infinity, rootPc: 0, template: CHORD_TEMPLATES[0] };
+  let second = -Infinity;
+  for (let root = 0; root < 12; root++) {
+    for (const tpl of CHORD_TEMPLATES) {
+      const tones = tpl.intervals.map((iv) => (root + iv) % 12);
+      let pos = 0;
+      for (let i = 0; i < tones.length; i++) pos += c[tones[i]] * tpl.weights[i];
+      pos /= tones.length;
+      let neg = 0;
+      let negCount = 0;
+      for (let p = 0; p < 12; p++) {
+        if (!tones.includes(p)) {
+          neg += c[p];
+          negCount++;
+        }
+      }
+      neg = negCount > 0 ? neg / negCount : 0;
+      const score = pos - neg * 0.45;
+      if (score > best.score) {
+        second = best.score;
+        best = { score, rootPc: root, template: tpl };
+      } else if (score > second) {
+        second = score;
+      }
+    }
+  }
+  if (best.score <= 0) return null;
+
+  const tonePcs = best.template.intervals.map((iv) => (best.rootPc + iv) % 12);
+  const margin = second > -Infinity ? (best.score - second) / Math.max(best.score, 1e-6) : 1;
+  const confidence = clamp01(best.score * 1.3 + margin * 0.6);
+
+  return {
+    name: PC_NAMES[best.rootPc] + best.template.quality,
+    rootPc: best.rootPc,
+    quality: best.template.quality,
+    tonePcs,
+    confidence,
+  };
+}
+
+interface BeatSlot {
+  start: number;
+  end: number;
+  match: ChordMatch | null;
+  bassChroma: Float32Array;
+}
+
+/**
+ * 小節ではなく拍単位でコードテンプレート照合を行い、同じコードが続く区間を
+ * まとめてセグメント化する。半小節・1拍でコードが変わる曲にも追従できる。
+ * 前後の拍が一致し当該拍だけ異なる場合は周囲に合わせる平滑化も行う
+ * (単発の誤検出によるチラつきを抑える)。
+ */
+function detectChordsPerBeat(grid: BeatGrid, frames: Frames, duration: number): AudioChordCandidate[] {
+  const beats = grid.beats;
+  if (beats.length < 2) return [];
   const frameAt = (sec: number) =>
     Math.max(
       0,
@@ -329,120 +560,86 @@ function detectChords(grid: BeatGrid, frames: Frames, duration: number): AudioCh
   for (let f = 0; f < frames.energy.length; f++) totalEnergy += frames.energy[f];
   const avgEnergy = totalEnergy / Math.max(1, frames.energy.length);
 
-  const raw: AudioChordCandidate[] = [];
-  for (let b = 0; b < bars.length; b++) {
-    const start = bars[b];
-    const end = b + 1 < bars.length ? bars[b + 1] : Math.min(duration, start + (60 / grid.bpm) * 4);
+  const slots: BeatSlot[] = [];
+  let tmp = new Float32Array(256); // フレーム数はビート長で決まるため通常はこれで足りる
+  for (let b = 0; b < beats.length; b++) {
+    const start = beats[b];
+    const end = b + 1 < beats.length ? beats[b + 1] : Math.min(duration, start + 60 / grid.bpm);
+    if (end <= start) continue;
     const f0 = frameAt(start);
     const f1 = Math.max(f0 + 1, frameAt(end));
+    const len = f1 - f0;
+    if (len > tmp.length) tmp = new Float32Array(len);
 
+    // ビート内フレームを合計ではなく中央値で集約する。突発的なノイズが1〜2フレームだけ
+    // 混入しても (例: 打楽器のHPSS抑制漏れ)、合計だと結果を歪めるが中央値なら埋もれる
     const ch = new Float32Array(12);
     const bch = new Float32Array(12);
-    let en = 0;
-    for (let f = f0; f < f1; f++) {
-      const c = frames.chroma[f];
-      const bc = frames.bassChroma[f];
-      for (let p = 0; p < 12; p++) {
-        ch[p] += c[p];
-        bch[p] += bc[p];
-      }
-      en += frames.energy[f];
+    for (let p = 0; p < 12; p++) {
+      for (let f = f0; f < f1; f++) tmp[f - f0] = frames.chroma[f][p];
+      ch[p] = medianOf(tmp, len);
+      for (let f = f0; f < f1; f++) tmp[f - f0] = frames.bassChroma[f][p];
+      bch[p] = medianOf(tmp, len);
     }
-    en /= f1 - f0;
-    // ほぼ無音の小節はコードを出さない
-    if (en < avgEnergy * 0.05) continue;
 
-    const match = matchTriad(ch);
-    if (!match) continue;
+    let en = 0;
+    for (let f = f0; f < f1; f++) en += frames.energy[f];
+    en /= Math.max(1, len);
+    const match = en < avgEnergy * 0.05 ? null : matchChord(ch);
+    slots.push({ start: round3(start), end: round3(end), match, bassChroma: bch });
+  }
+  if (slots.length === 0) return [];
 
-    // ベース音候補: bass chromaが最強のPCがコードトーンならオンコード扱い
-    let bass: string | undefined;
-    let name = match.name;
-    const bassPc = argmax(bch);
+  // 平滑化: 前後の拍が一致し当該拍だけ違う場合は周囲に合わせる
+  const names = slots.map((s) => s.match?.name ?? null);
+  for (let i = 1; i < slots.length - 1; i++) {
+    const prev = names[i - 1], cur = names[i], next = names[i + 1];
+    if (cur !== null && prev !== null && next !== null && prev === next && cur !== prev) {
+      slots[i] = { ...slots[i], match: slots[i - 1].match };
+    }
+  }
+
+  // 連続する同一コードの拍をまとめてセグメント化 (ベース音はセグメント全体で集計)
+  const result: AudioChordCandidate[] = [];
+  let i = 0;
+  while (i < slots.length) {
+    const cur = slots[i];
+    if (!cur.match) {
+      i++;
+      continue;
+    }
+    let j = i + 1;
+    const bassAcc = Float32Array.from(cur.bassChroma);
+    while (j < slots.length && slots[j].match?.name === cur.match.name) {
+      for (let p = 0; p < 12; p++) bassAcc[p] += slots[j].bassChroma[p];
+      j++;
+    }
+
+    let name = cur.match.name;
+    let bass = PC_NAMES[cur.match.rootPc];
+    const bassPc = argmax(bassAcc);
     if (
       bassPc >= 0 &&
-      bassPc !== match.rootPc &&
-      match.tonePcs.includes(bassPc) &&
-      bch[bassPc] > bch[match.rootPc] * 1.4
+      bassPc !== cur.match.rootPc &&
+      cur.match.tonePcs.includes(bassPc) &&
+      bassAcc[bassPc] > bassAcc[cur.match.rootPc] * 1.4
     ) {
       bass = PC_NAMES[bassPc];
-      name = `${match.name}/${bass}`;
+      name = `${cur.match.name}/${bass}`;
     }
 
-    raw.push({
-      start: round3(start),
-      end: round3(end),
+    result.push({
+      start: cur.start,
+      end: slots[j - 1].end,
       chord: name,
-      root: PC_NAMES[match.rootPc],
-      quality: match.quality,
-      bass: bass ?? PC_NAMES[match.rootPc],
-      confidence: round3(match.confidence),
+      root: PC_NAMES[cur.match.rootPc],
+      quality: cur.match.quality,
+      bass,
+      confidence: round3(cur.match.confidence),
     });
+    i = j;
   }
-
-  // 連続する同一コードをマージ
-  const merged: AudioChordCandidate[] = [];
-  for (const c of raw) {
-    const last = merged[merged.length - 1];
-    if (last && last.chord === c.chord && Math.abs(last.end - c.start) < 0.05) {
-      last.end = c.end;
-      last.confidence = Math.max(last.confidence, c.confidence);
-    } else {
-      merged.push({ ...c });
-    }
-  }
-  return merged;
-}
-
-/** メジャー/マイナートライアド24種のテンプレート照合 + 7th拡張チェック */
-function matchTriad(
-  chroma: Float32Array
-): { name: string; rootPc: number; quality: string; tonePcs: number[]; confidence: number } | null {
-  const n = norm(chroma);
-  if (n === 0) return null;
-  const c = new Float32Array(12);
-  for (let i = 0; i < 12; i++) c[i] = chroma[i] / n;
-
-  let best = { score: -Infinity, rootPc: 0, minor: false };
-  let second = -Infinity;
-  for (let root = 0; root < 12; root++) {
-    for (const minor of [false, true]) {
-      const third = (root + (minor ? 3 : 4)) % 12;
-      const fifth = (root + 7) % 12;
-      // ルート・3度・5度を重み付きで合計し、非コードトーンを減点
-      let score = c[root] * 1.0 + c[third] * 0.9 + c[fifth] * 0.7;
-      for (let p = 0; p < 12; p++) {
-        if (p !== root && p !== third && p !== fifth) score -= c[p] * 0.15;
-      }
-      if (score > best.score) {
-        second = best.score;
-        best = { score, rootPc: root, minor };
-      } else if (score > second) {
-        second = score;
-      }
-    }
-  }
-  if (best.score <= 0) return null;
-
-  const { rootPc, minor } = best;
-  const third = (rootPc + (minor ? 3 : 4)) % 12;
-  const fifth = (rootPc + 7) % 12;
-  const tonePcs = [rootPc, third, fifth];
-
-  // b7が十分鳴っていればセブンスを付ける
-  let quality = minor ? "m" : "";
-  const b7 = (rootPc + 10) % 12;
-  const triadAvg = (c[rootPc] + c[third] + c[fifth]) / 3;
-  if (c[b7] > triadAvg * 0.75) {
-    quality = minor ? "m7" : "7";
-    tonePcs.push(b7);
-  }
-
-  // 信頼度: 絶対スコアと2位との差分から
-  const margin = second > -Infinity ? (best.score - second) / Math.max(best.score, 1e-6) : 1;
-  const confidence = clamp01(best.score * 0.55 + margin * 1.2);
-
-  return { name: PC_NAMES[rootPc] + quality, rootPc, quality, tonePcs, confidence };
+  return result;
 }
 
 function argmax(v: Float32Array): number {
