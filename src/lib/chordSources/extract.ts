@@ -20,13 +20,91 @@ function normalizeSection(s: string): string {
 
 function normalizeChordToken(tok: string): string | null {
   const t = tok
+    .normalize("NFKC") // 全角英数・記号を半角へ (Ａｍ７ → Am7)
     .replace(/[（(].*?[)）]$/, (m) => (/[#b♯♭+\-59]/.test(m) ? m : "")) // (b5)等は残す
     .replace(/[、。,.!?！？]$/g, "")
     .trim();
   if (!t || t.length > 10) return null;
+  if (/^N\.?C\.?$/i.test(t)) return "N.C.";
   if (!CHORD_TOKEN_RE.test(t)) return null;
   // 歌詞の英単語 (A, Ah など) を誤検出しないよう、単独の A/E は文脈で拾う側に任せる
   return t;
+}
+
+export interface PageMeta {
+  /** カポ位置 (例: 2)。半音下げチューニングは -1 */
+  capo?: number;
+  /** キー表記 (例: "E♭", "Am") */
+  keyLabel?: string;
+}
+
+/** ページからカポ・キー情報を検出する */
+export function extractPageMeta(html: string): PageMeta {
+  const text = decodeEntities(html.replace(/<[^>]+>/g, " ")).normalize("NFKC");
+  const meta: PageMeta = {};
+
+  const capoM =
+    text.match(/カポ[^0-9+-]{0,4}([0-9]{1,2})/) ??
+    text.match(/capo[^0-9+-]{0,4}([0-9]{1,2})/i);
+  if (capoM) {
+    const capo = parseInt(capoM[1], 10);
+    if (capo >= 0 && capo <= 9) meta.capo = capo;
+  }
+  if (meta.capo === undefined && /半音下げ/.test(text)) meta.capo = -1;
+  if (/カポ\s*(?:なし|無し|0)/.test(text)) meta.capo = 0;
+
+  const keyM = text.match(/(?:原曲)?(?:キー|Key)\s*[:：=]?\s*([A-G][#♯♭]?m?)(?![A-Za-z0-9])/i);
+  if (keyM) meta.keyLabel = keyM[1];
+
+  return meta;
+}
+
+/**
+ * script内のJS文字列リテラルからコード列を抽出する。
+ * U-FRETなど、コード進行をJSデータとして埋め込みクライアント側で描画するサイト向け。
+ * 引用符で囲まれた文字列のうちコード表記率が十分高い場合のみ採用する (誤検出防止)。
+ */
+export function extractChordsFromScripts(html: string, maxChords = 400): ExtractedChord[] {
+  const scripts: string[] = [];
+  const re = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html))) scripts.push(m[1]);
+
+  let best: ExtractedChord[] = [];
+  for (const script of scripts) {
+    const strRe = /["']([^"'\\\n]{1,12})["']/g;
+    const tokens: string[] = [];
+    let total = 0;
+    let sm: RegExpExecArray | null;
+    while ((sm = strRe.exec(script)) && tokens.length < maxChords) {
+      const raw = sm[1].trim();
+      if (!raw || raw.length > 10) continue;
+      // 英数字を含む短い文字列のみ分母に数える
+      if (!/[A-Za-zＡ-Ｚａ-ｚ]/.test(raw)) continue;
+      total++;
+      const tok = normalizeChordToken(raw);
+      if (tok) tokens.push(tok);
+    }
+    // コード率が高く数が十分なスクリプトだけをコードデータとみなす
+    if (tokens.length >= 16 && total > 0 && tokens.length / total >= 0.6) {
+      if (tokens.length > best.length) best = tokens.map((name) => ({ name }));
+    }
+  }
+  return best;
+}
+
+/** 抽出結果と使った戦略 (デバッグ用) */
+export function extractChordsDetailed(
+  html: string,
+  maxChords = 400
+): { chords: ExtractedChord[]; strategy: string } {
+  const fromMarkup = extractChordsFromHtml(html, maxChords);
+  if (fromMarkup.length >= 8) return { chords: fromMarkup, strategy: "markup/text" };
+  const fromScripts = extractChordsFromScripts(html, maxChords);
+  if (fromScripts.length > fromMarkup.length) {
+    return { chords: fromScripts, strategy: "script-data" };
+  }
+  return { chords: fromMarkup, strategy: "markup/text" };
 }
 
 /**

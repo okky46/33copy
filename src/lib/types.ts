@@ -91,6 +91,39 @@ export interface ExternalSourceResult {
   pageTitle: string;
   chords: { name: string; section?: string }[];
   score: number;
+  /** ページに書かれていたカポ位置 (検出できた場合) */
+  capo?: number;
+  /** ページに書かれていたキー表記 (検出できた場合) */
+  keyLabel?: string;
+  /** 抽出方法などのメモ (デバッグ用) */
+  note?: string;
+}
+
+/** 外部検索のデバッグ情報 (検索が実際に機能しているかの確認用) */
+export interface AnalyzeDebug {
+  songTitle: string;
+  artist: string;
+  /** 実際に投げた検索クエリ */
+  queries: string[];
+  /** 検索プロバイダーごとの結果 */
+  searches: { provider: string; query: string; hitCount: number; error?: string }[];
+  /** スコアリングした候補URL (採用/除外と理由) */
+  candidates: { url: string; title: string; score: number; accepted: boolean; reasons: string[] }[];
+  /** 取得・パースした結果 */
+  fetched: {
+    url: string;
+    provider: string;
+    ok: boolean;
+    chordCount: number;
+    capo?: number;
+    note?: string;
+  }[];
+  /** 最終的に採用したソースURL */
+  adopted: string[];
+  /** ソース間のキー補正 (移調量) メモ */
+  keyCorrections: string[];
+  /** 外部検索にかかった時間 (ms) */
+  elapsedMs: number;
 }
 
 /** /api/analyze のレスポンス */
@@ -113,9 +146,13 @@ export interface AnalyzeResult {
     providers: string[];
     /** 照合スコア 0..1 */
     score: number;
+    /** 複数ソースが存在するのに一致しなかった (要確認) */
+    disputed?: boolean;
   }[];
   sources: { provider: string; url: string; pageTitle: string; chordCount: number }[];
   message: string;
+  /** 外部検索のデバッグ情報 */
+  debug: AnalyzeDebug;
 }
 
 /** 再生モード */
@@ -165,6 +202,8 @@ export interface Project {
   audioFileName?: string;
   /** 解析結果サマリー */
   analysis?: AnalysisSummary | null;
+  /** 外部検索のデバッグ情報 (開発用表示) */
+  debug?: AnalyzeDebug | null;
   loop: LoopRange;
   settings: {
     playMode: PlayMode;

@@ -133,18 +133,62 @@ export function guessSong(videoTitle: string, channelName: string): SongGuess {
   return { title, artist, confidence, queries };
 }
 
-/** コード譜検索用のクエリ群を作る */
+/**
+ * 表記揺れバリアントを作る。
+ * 全角/半角・スペース有無・括弧内の別表記などを考慮し、1つの表記で諦めない。
+ */
+export function nameVariants(name: string): string[] {
+  const out = new Set<string>();
+  const base = name.trim();
+  if (!base) return [];
+  out.add(base);
+  // 全角英数・記号を半角へ (ＮＦＫＣ)
+  out.add(base.normalize("NFKC"));
+  // スペース除去 / 中黒・アンダースコア除去
+  out.add(base.replace(/[\s　・_]/g, ""));
+  // 記号を除去 (≠, ！, ？などを含む表記への保険。ただし1文字目の記号は残す判断が難しいので両方)
+  const stripped = base.normalize("NFKC").replace(/[!?！？☆★♪♡〜~-]/g, "").trim();
+  if (stripped.length >= 2) out.add(stripped);
+  // 括弧内の別表記 「曲名(English Title)」→ 両方
+  const paren = base.match(/^(.+?)[（(]([^)）]+)[)）]\s*$/);
+  if (paren) {
+    if (paren[1].trim().length >= 2) out.add(paren[1].trim());
+    if (paren[2].trim().length >= 2) out.add(paren[2].trim());
+  }
+  return [...out].filter(Boolean);
+}
+
+/**
+ * コード譜検索用のクエリ群を作る。
+ * コード掲載サイトにヒットしやすい語 (コード/ギターコード/ピアノコード/弾き語り/chords) を
+ * 組み合わせ、表記バリアントも織り込む。先頭ほど優先。
+ */
 export function buildQueries(title: string, artist: string): string[] {
   const qs: string[] = [];
-  if (title && artist) {
-    qs.push(`${title} ${artist} コード`);
-    qs.push(`${artist} ${title} コード`);
-    qs.push(`${title} ${artist} 弾き語り コード`);
-    qs.push(`${artist} ${title} chords`);
+  const tVars = nameVariants(title);
+  const aVars = nameVariants(artist);
+  const t = tVars[0] ?? "";
+  const a = aVars[0] ?? "";
+
+  if (t && a) {
+    qs.push(`${t} ${a} コード`);
+    qs.push(`${a} ${t} コード`);
+    qs.push(`${t} ${a} ギターコード`);
+    qs.push(`${t} ${a} 弾き語り`);
+    qs.push(`${a} ${t} chords`);
   }
-  if (title) {
-    qs.push(`${title} コード`);
-    qs.push(`${title} ピアノ コード`);
+  if (t) {
+    qs.push(`${t} コード`);
+    qs.push(`${t} ギターコード`);
+    qs.push(`${t} ピアノコード`);
+    qs.push(`${t} chord`);
   }
-  return Array.from(new Set(qs));
+  // 表記バリアントでの再検索クエリ (後方に積む)
+  for (const tv of tVars.slice(1, 3)) {
+    qs.push(a ? `${tv} ${a} コード` : `${tv} コード`);
+  }
+  for (const av of aVars.slice(1, 3)) {
+    if (t) qs.push(`${t} ${av} コード`);
+  }
+  return Array.from(new Set(qs.map((q) => q.replace(/\s+/g, " ").trim())));
 }

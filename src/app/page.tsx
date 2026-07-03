@@ -12,6 +12,8 @@ import type { AnalyzeResult, ChordEvent, Project, PlayMode, SnapMode } from "@/l
 import {
   addChordAt,
   normalizeTimeline,
+  placeOnGrid,
+  rebuildGrid,
   shiftTimeline,
   snapTime,
   splitAt,
@@ -117,6 +119,7 @@ export default function Home() {
         audioChords: base?.audioChords,
         audioFileName: base?.audioFileName,
         analysis: out.summary,
+        debug: result.debug,
         loop: base?.loop ?? { enabled: false, start: 0, end: 0 },
         settings:
           base?.settings ?? { playMode: "original", chordVolume: 0.6, chordLength: 0.9, snapMode: "beat" },
@@ -213,6 +216,7 @@ export default function Home() {
             timeline: [],
             beatGrid: null,
             analysis: null,
+            debug: result.debug,
             loop: { enabled: false, start: 0, end: 0 },
             settings: { playMode: "original", chordVolume: 0.6, chordLength: 0.9, snapMode: "beat" },
             updatedAt: now,
@@ -399,6 +403,51 @@ export default function Home() {
     },
     [updateTimeline]
   );
+
+  /** BPMを手動変更してグリッドを引き直す */
+  const setGridBpm = useCallback((bpm: number) => {
+    if (!Number.isFinite(bpm) || bpm < 20 || bpm > 300) return;
+    setProject((p) => {
+      if (!p) return p;
+      const dur = p.duration || 300;
+      const g = rebuildGrid(
+        bpm,
+        p.beatGrid?.firstDownbeat ?? 0,
+        dur,
+        p.beatGrid?.source ?? "assumed",
+        p.beatGrid?.confidence ?? 0.5
+      );
+      return g ? { ...p, beatGrid: g } : p;
+    });
+  }, []);
+
+  /** 最初の小節頭を現在位置に合わせてグリッドを引き直す */
+  const alignDownbeatToNow = useCallback(() => {
+    const t = engine.timeRef.current;
+    setProject((p) => {
+      if (!p || !p.beatGrid) return p;
+      const dur = p.duration || 300;
+      const g = rebuildGrid(p.beatGrid.bpm, t, dur, p.beatGrid.source, p.beatGrid.confidence);
+      return g ? { ...p, beatGrid: g } : p;
+    });
+  }, [engine.timeRef]);
+
+  /** 進行を現在のグリッドに再配置する (編集がある場合は確認) */
+  const replaceOnGrid = useCallback(() => {
+    setProject((p) => {
+      if (!p || !p.beatGrid || !p.progression || p.progression.length === 0) return p;
+      if (
+        p.timeline.some((e) => e.edited) &&
+        !window.confirm("編集済みのコードも含めてグリッドに再配置します。よろしいですか？")
+      ) {
+        return p;
+      }
+      let tl = placeOnGrid(p.progression, p.beatGrid, p.duration || 300);
+      if (p.audioChords && p.audioChords.length > 0) tl = verifyWithAudio(tl, p.audioChords);
+      return { ...p, timeline: tl };
+    });
+    setSelectedId(null);
+  }, []);
 
   const manualSave = useCallback(() => {
     if (!project) return;
@@ -676,6 +725,65 @@ export default function Home() {
             </details>
           )}
 
+          {project.debug && (
+            <details className="sources-detail debug-detail">
+              <summary>
+                🔍 検索デバッグ情報（開発用）— クエリ{project.debug.queries.length}件 /
+                候補{project.debug.candidates.length}件 / 採用{project.debug.adopted.length}件 /
+                {(project.debug.elapsedMs / 1000).toFixed(1)}秒
+              </summary>
+              <div className="debug-body">
+                <p>
+                  <b>推定曲名:</b> {project.debug.songTitle || "(なし)"} ／{" "}
+                  <b>推定アーティスト:</b> {project.debug.artist || "(なし)"}
+                </p>
+                <p className="debug-label">検索クエリ:</p>
+                <ul>
+                  {project.debug.queries.map((q) => <li key={q}><code>{q}</code></li>)}
+                </ul>
+                <p className="debug-label">検索実行:</p>
+                <ul>
+                  {project.debug.searches.map((s, i) => (
+                    <li key={i}>
+                      [{s.provider}] <code>{s.query}</code> → {s.hitCount}件
+                      {s.error && <span className="debug-err"> エラー: {s.error}</span>}
+                    </li>
+                  ))}
+                </ul>
+                <p className="debug-label">候補URL (採用✓ / 除外✗ と理由):</p>
+                <ul>
+                  {project.debug.candidates.map((c) => (
+                    <li key={c.url} className={c.accepted ? "" : "debug-rejected"}>
+                      {c.accepted ? "✓" : "✗"} [{c.score}] {c.title || c.url}
+                      <br />
+                      <span className="muted small">{c.url} — {c.reasons.join(" / ")}</span>
+                    </li>
+                  ))}
+                  {project.debug.candidates.length === 0 && <li className="muted">候補なし</li>}
+                </ul>
+                <p className="debug-label">取得・パース結果:</p>
+                <ul>
+                  {project.debug.fetched.map((f, i) => (
+                    <li key={i} className={f.ok ? "" : "debug-rejected"}>
+                      {f.ok ? "✓" : "✗"} {f.url} — {f.chordCount}コード
+                      {f.capo !== undefined && ` / カポ${f.capo}`}
+                      {f.note && ` / ${f.note}`}
+                    </li>
+                  ))}
+                  {project.debug.fetched.length === 0 && <li className="muted">取得なし</li>}
+                </ul>
+                {project.debug.keyCorrections.length > 0 && (
+                  <>
+                    <p className="debug-label">キー・カポ補正:</p>
+                    <ul>
+                      {project.debug.keyCorrections.map((k, i) => <li key={i}>{k}</li>)}
+                    </ul>
+                  </>
+                )}
+              </div>
+            </details>
+          )}
+
           <div className="main-grid">
             <div className="left-col">
               <div className="video-wrap">
@@ -799,6 +907,34 @@ export default function Home() {
               <button className="btn small" onClick={() => shiftAll(-0.1)} title="Shift+←">−0.1s</button>
               <button className="btn small" onClick={() => shiftAll(0.1)} title="Shift+→">＋0.1s</button>
               <button className="btn small" onClick={() => shiftAll(0.5)}>＋0.5s</button>
+            </span>
+            <span className="grid-group">
+              <span className="label">BPM</span>
+              <input
+                type="number"
+                className="bpm-input"
+                min={20} max={300} step={0.1}
+                value={grid?.bpm ?? ""}
+                placeholder="—"
+                onChange={(e) => setGridBpm(parseFloat(e.target.value))}
+                title="BPMを手動変更してグリッドを引き直す"
+              />
+              <button
+                className="btn small"
+                onClick={alignDownbeatToNow}
+                disabled={!grid}
+                title="最初の小節頭を現在の再生位置に合わせる"
+              >
+                小節頭=現在
+              </button>
+              <button
+                className="btn small"
+                onClick={replaceOnGrid}
+                disabled={!grid || !project.progression || project.progression.length === 0}
+                title="外部コード進行を現在のグリッドに再配置する"
+              >
+                グリッドに再配置
+              </button>
             </span>
           </div>
           <p className="muted small shortcut-hint">

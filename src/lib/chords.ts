@@ -12,6 +12,8 @@ export interface ParsedChord {
   bassPc: number;
   isSlash: boolean;
   valid: boolean;
+  /** N.C. (ノーコード) */
+  isNoChord?: boolean;
 }
 
 export interface Voicing {
@@ -63,7 +65,9 @@ const QUALITY_INTERVALS: [RegExp, number[]][] = [
 
 /** テキストがコード名として妥当かの正規表現 (抽出フィルタにも使う) */
 export const CHORD_TOKEN_RE =
-  /^[A-G][#b♯♭]?(?:maj9|maj7|Maj7|M7|M9|△7|△9|△|mM7|mmaj7|m7b5|m7-5|m7\(b5\)|dim7|dim|aug7|aug|m9|m7|m6|madd9|m|7sus4|sus4|sus2|add9|69|6|9|11|13|7\(?[#b+-]?[59]\)?|7|o|ø|\+)?(?:\/[A-G][#b♯♭]?)?$/;
+  /^(?:N\.?C\.?|[A-G][#b♯♭]?(?:maj9|maj7|Maj7|M7|M9|△7|△9|△|mM7|mmaj7|m7b5|m7-5|m7♭5|m7\(b5\)|dim7|dim|aug7|aug|m9|m7|m6|madd9|m|7sus4|sus4|sus2|add9|69|6|9|11|13|7\(?[#b+-]?[59]\)?|7|o|ø|\+)?(?:\/[A-G][#b♯♭]?)?)$/;
+
+const NO_CHORD_RE = /^N\.?C\.?$/i;
 
 function normalizeAccidental(s: string): string {
   return s.replace("♯", "#").replace("♭", "b");
@@ -71,7 +75,13 @@ function normalizeAccidental(s: string): string {
 
 /** コード名文字列をパースする。パースできない場合 valid=false でメジャートライアド扱い */
 export function parseChord(raw: string): ParsedChord {
-  const name = normalizeAccidental(raw.trim());
+  const name = normalizeAccidental(raw.trim().replace("m7♭5", "m7b5"));
+  if (NO_CHORD_RE.test(name)) {
+    return {
+      name: "N.C.", root: "", rootPc: -1, quality: "N.C.", intervals: [],
+      bass: "", bassPc: -1, isSlash: false, valid: true, isNoChord: true,
+    };
+  }
   const m = name.match(/^([A-G][#b]?)([^/]*)(?:\/([A-G][#b]?))?$/);
   const fallback: ParsedChord = {
     name: raw, root: "C", rootPc: 0, quality: "", intervals: [0, 4, 7],
@@ -119,6 +129,7 @@ export function midiToFreq(midi: number): number {
  *     Am7 -> L:A2 R:G3 C4 E4 / Fmaj7 -> L:F2 R:A3 C4 E4
  */
 export function voiceChord(chord: ParsedChord): Voicing {
+  if (chord.isNoChord || chord.intervals.length === 0) return { left: [], right: [] };
   // 左手: C2(36)..B2(47)
   const left = [36 + chord.bassPc];
 
@@ -173,8 +184,25 @@ const QUALITY_DESC: [RegExp, string][] = [
   [/^(maj|M|△)?$/, "明るくストレートなメジャーコード"],
 ];
 
+/** ピッチクラス → 音名 (シャープ表記) */
+export function pcName(pc: number): string {
+  return PC_TO_NAME_SHARP[((pc % 12) + 12) % 12];
+}
+
+/** コード名を半音k個ぶん移調する (キー違いソースの補正用) */
+export function transposeChordName(name: string, k: number): string {
+  const shift = ((k % 12) + 12) % 12;
+  if (shift === 0) return name;
+  const p = parseChord(name);
+  if (!p.valid || p.isNoChord) return p.isNoChord ? "N.C." : name;
+  const root = pcName(p.rootPc + shift);
+  const slash = p.isSlash ? `/${pcName(p.bassPc + shift)}` : "";
+  return root + p.quality + slash;
+}
+
 /** コードの簡単な日本語説明を生成 */
 export function describeChord(chord: ParsedChord): string {
+  if (chord.isNoChord) return "N.C. (ノーコード)。伴奏を止めるかブレイクにする部分";
   if (!chord.valid) return "未対応のコード表記のため、メジャーコードとして表示しています";
   let desc = "";
   for (const [re, d] of QUALITY_DESC) {
@@ -188,6 +216,7 @@ export function describeChord(chord: ParsedChord): string {
 
 /** ルートのピッチクラス → タイムライン表示用カラー */
 export function chordColor(rootPc: number, isMinor: boolean): string {
+  if (rootPc < 0) return "hsl(220 8% 45%)"; // N.C.
   const hue = (rootPc * 30) % 360;
   return `hsl(${hue} ${isMinor ? 35 : 55}% ${isMinor ? 38 : 45}%)`;
 }
