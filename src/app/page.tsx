@@ -1,25 +1,40 @@
 "use client";
 
 // メイン画面: URL入力 → 解析 → YouTube同期コード表示・編集・保存
+//
+// プロダクト方針:
+// - 根拠 (外部コード譜 / 音源解析 / 手動入力 / 保存済み) のないコード進行は表示しない
+// - 取得できなかった場合は正直に伝え、音源解析・曲名修正・手動入力へ誘導する
+// - タイミングは拍・小節グリッドに沿わせ、ユーザーがすぐ直せるようにする
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { AnalyzeResult, ChordEvent, Project, PlayMode } from "@/lib/types";
-import { buildTimeline, normalizeTimeline, splitAt, addChordAt } from "@/lib/timeline";
+import type { AnalyzeResult, ChordEvent, Project, PlayMode, SnapMode } from "@/lib/types";
+import {
+  addChordAt,
+  normalizeTimeline,
+  shiftTimeline,
+  snapTime,
+  splitAt,
+} from "@/lib/timeline";
+import { integrate, verifyWithAudio } from "@/lib/integrate";
 import { parseChord, voiceChord } from "@/lib/chords";
 import { deleteProject, listProjects, loadProject, saveProject } from "@/lib/storage";
+import { decodeAudioFile } from "@/lib/audioAnalysis/decode";
+import { analyzeAudio } from "@/lib/audioAnalysis/analyze";
 import { useYouTubePlayer } from "@/hooks/useYouTubePlayer";
 import { useSyncEngine } from "@/hooks/useSyncEngine";
 import PianoKeyboard from "@/components/PianoKeyboard";
 import ChordDisplay from "@/components/ChordDisplay";
 import Timeline, { formatTime } from "@/components/Timeline";
 import ChordEditor from "@/components/ChordEditor";
+import ThemeToggle from "@/components/ThemeToggle";
 
 const ANALYZE_STEPS = [
-  "動画情報を取得中…",
+  "曲情報を取得中…",
   "曲名・アーティスト名を推定中…",
-  "外部コード譜を検索中…",
-  "複数ソースのコードを照合中…",
-  "コードタイムラインを生成中…",
+  "外部コード情報を検索中…",
+  "コード候補を統合中…",
+  "タイムラインを生成中…",
 ];
 
 const PLAYER_CONTAINER_ID = "yt-player-container";
@@ -27,15 +42,18 @@ const PLAYER_CONTAINER_ID = "yt-player-container";
 export default function Home() {
   const [urlInput, setUrlInput] = useState("");
   const [analyzeStep, setAnalyzeStep] = useState(-1); // -1 = 解析中でない
+  const [audioProgress, setAudioProgress] = useState<number | null>(null);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [project, setProject] = useState<Project | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [savedProjects, setSavedProjects] = useState<Project[]>([]);
   const [savedFlash, setSavedFlash] = useState(false);
+  const [searchTitle, setSearchTitle] = useState("");
+  const [searchArtist, setSearchArtist] = useState("");
 
-  // 解析結果 (動画長が後から判明したときのタイムライン構築用)
+  // 解析結果 (動画長が後から判明したときの統合用)
   const pendingResult = useRef<AnalyzeResult | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { handle: yt, isPlaying: ytIsPlaying, duration: ytDuration } = useYouTubePlayer(
     project?.videoId ?? null,
@@ -44,8 +62,10 @@ export default function Home() {
 
   const duration = project ? (project.duration || ytDuration) : 0;
   const mode = project?.settings.playMode ?? "original";
+  const snapMode = project?.settings.snapMode ?? "beat";
   const loop = project?.loop ?? { enabled: false, start: 0, end: 0 };
   const timeline = useMemo(() => project?.timeline ?? [], [project?.timeline]);
+  const grid = project?.beatGrid ?? null;
 
   const engine = useSyncEngine({
     mode,
@@ -62,94 +82,218 @@ export default function Home() {
   const nextChord = engine.chordIndex >= 0 ? timeline[engine.chordIndex + 1] ?? null : null;
   const selectedChord = timeline.find((e) => e.id === selectedId) ?? null;
 
-  // 起動時に保存済みプロジェクト一覧
   useEffect(() => setSavedProjects(listProjects()), [project]);
 
-  // プレイヤーから動画長が判明したら、タイムライン未構築なら構築する
+  // 曲名修正フォームの初期値
+  useEffect(() => {
+    if (project) {
+      setSearchTitle(project.songGuess.title);
+      setSearchArtist(project.songGuess.artist);
+    }
+  }, [project?.videoId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /** 解析結果 + (あれば) 音源解析を統合してプロジェクトに反映する */
+  const applyIntegration = useCallback(
+    (result: AnalyzeResult, dur: number, base?: Project | null) => {
+      const audioGrid = base?.beatGrid?.source === "audio" ? base.beatGrid : null;
+      const out = integrate({
+        progression: result.progression,
+        sourceCount: result.sources.length,
+        duration: dur,
+        audioGrid,
+        audioChords: base?.audioChords ?? null,
+      });
+      const now = Date.now();
+      setProject({
+        videoId: result.videoId,
+        videoTitle: result.videoTitle,
+        channelName: result.channelName,
+        duration: dur,
+        songGuess: result.songGuess,
+        sources: result.sources,
+        progression: result.progression,
+        timeline: out.timeline,
+        beatGrid: out.grid ?? audioGrid,
+        audioChords: base?.audioChords,
+        audioFileName: base?.audioFileName,
+        analysis: out.summary,
+        loop: base?.loop ?? { enabled: false, start: 0, end: 0 },
+        settings:
+          base?.settings ?? { playMode: "original", chordVolume: 0.6, chordLength: 0.9, snapMode: "beat" },
+        updatedAt: now,
+        createdAt: base?.createdAt ?? now,
+      });
+      setSelectedId(null);
+    },
+    []
+  );
+
+  // プレイヤーから動画長が判明したら、統合が保留中なら実行する
   useEffect(() => {
     if (!project || ytDuration <= 0) return;
-    if (project.timeline.length === 0 && pendingResult.current) {
-      const tl = buildTimeline(pendingResult.current.progression, ytDuration);
-      setProject((p) => (p ? { ...p, duration: ytDuration, timeline: tl } : p));
+    if (pendingResult.current && project.duration === 0) {
+      applyIntegration(pendingResult.current, ytDuration, project);
+      pendingResult.current = null;
     } else if (!project.duration) {
       setProject((p) => (p ? { ...p, duration: ytDuration } : p));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ytDuration, project?.videoId]);
 
-  // 自動保存 (800msデバウンス)
+  // 自動保存 (800msデバウンス)。空タイムラインでも音源解析結果があれば保存する
   useEffect(() => {
-    if (!project || project.timeline.length === 0) return;
+    if (!project) return;
+    if (project.timeline.length === 0 && !project.beatGrid) return;
     const timer = setTimeout(() => saveProject(project), 800);
     return () => clearTimeout(timer);
   }, [project]);
 
   /** 解析実行 */
-  const analyze = useCallback(async (force = false) => {
-    setError("");
-    setNotice("");
-    const url = urlInput.trim();
-    if (!url) return;
+  const analyze = useCallback(
+    async (opts: { force?: boolean; title?: string; artist?: string } = {}) => {
+      setError("");
+      const url = urlInput.trim();
+      if (!url) return;
 
-    // 保存済みプロジェクトがあればそれを開く
-    if (!force) {
-      const idMatch = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([A-Za-z0-9_-]{11})|^([A-Za-z0-9_-]{11})$/);
-      const vid = idMatch ? (idMatch[1] || idMatch[2]) : null;
-      if (vid) {
-        const saved = loadProject(vid);
-        if (saved) {
-          pendingResult.current = null;
-          setProject(saved);
-          setSelectedId(null);
-          setNotice("保存済みプロジェクトを読み込みました。最初から解析し直す場合は「再解析」を押してください。");
-          return;
+      // 保存済みプロジェクトがあればそれを開く (ユーザー編集済みコードは最優先)
+      if (!opts.force) {
+        const idMatch = url.match(
+          /(?:v=|youtu\.be\/|embed\/|shorts\/)([A-Za-z0-9_-]{11})|^([A-Za-z0-9_-]{11})$/
+        );
+        const vid = idMatch ? idMatch[1] || idMatch[2] : null;
+        if (vid) {
+          const saved = loadProject(vid);
+          if (saved) {
+            pendingResult.current = null;
+            setProject(saved);
+            setSelectedId(null);
+            return;
+          }
         }
       }
-    }
 
-    setAnalyzeStep(0);
-    // 解析中のステップ表示を進める (演出。実際の解析は1リクエスト)
-    const stepTimer = setInterval(() => {
-      setAnalyzeStep((s) => (s >= 0 && s < ANALYZE_STEPS.length - 1 ? s + 1 : s));
-    }, 2500);
+      setAnalyzeStep(0);
+      const stepTimer = setInterval(() => {
+        setAnalyzeStep((s) => (s >= 0 && s < ANALYZE_STEPS.length - 1 ? s + 1 : s));
+      }, 2500);
 
-    try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error ?? "解析に失敗しました");
-        return;
+      try {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            url,
+            titleOverride: opts.title,
+            artistOverride: opts.artist,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setError(data.error ?? "解析に失敗しました");
+          return;
+        }
+        const result = data as AnalyzeResult;
+        // 同じ動画の再解析なら音源解析結果・ループ・設定を引き継ぐ
+        const base = project?.videoId === result.videoId ? project : null;
+        if (result.duration > 0 || (base && base.duration > 0)) {
+          applyIntegration(result, result.duration || base!.duration, base);
+          pendingResult.current = null;
+        } else {
+          // 動画長不明 → プレイヤーのdurationが取れてから統合
+          pendingResult.current = result;
+          const now = Date.now();
+          setProject({
+            videoId: result.videoId,
+            videoTitle: result.videoTitle,
+            channelName: result.channelName,
+            duration: 0,
+            songGuess: result.songGuess,
+            sources: result.sources,
+            progression: result.progression,
+            timeline: [],
+            beatGrid: null,
+            analysis: null,
+            loop: { enabled: false, start: 0, end: 0 },
+            settings: { playMode: "original", chordVolume: 0.6, chordLength: 0.9, snapMode: "beat" },
+            updatedAt: now,
+            createdAt: now,
+          });
+          setSelectedId(null);
+        }
+      } catch {
+        setError("解析リクエストに失敗しました。ネットワークを確認してください。");
+      } finally {
+        clearInterval(stepTimer);
+        setAnalyzeStep(-1);
       }
-      const result = data as AnalyzeResult;
-      pendingResult.current = result;
-      const tl = result.duration > 0 ? buildTimeline(result.progression, result.duration) : [];
-      const now = Date.now();
-      setProject({
-        videoId: result.videoId,
-        videoTitle: result.videoTitle,
-        channelName: result.channelName,
-        duration: result.duration,
-        songGuess: result.songGuess,
-        sources: result.sources,
-        timeline: tl,
-        loop: { enabled: false, start: 0, end: 0 },
-        settings: { playMode: "original", chordVolume: 0.6, chordLength: 0.9 },
-        updatedAt: now,
-        createdAt: now,
-      });
-      setSelectedId(null);
-      setNotice(result.message);
-    } catch {
-      setError("解析リクエストに失敗しました。ネットワークを確認してください。");
-    } finally {
-      clearInterval(stepTimer);
-      setAnalyzeStep(-1);
-    }
-  }, [urlInput]);
+    },
+    [urlInput, project, applyIntegration]
+  );
+
+  /** 音源ファイルの解析 */
+  const handleAudioFile = useCallback(
+    async (file: File) => {
+      if (!project) return;
+      setError("");
+      setAudioProgress(0);
+      try {
+        const { samples, sampleRate } = await decodeAudioFile(file);
+        const result = await analyzeAudio(samples, sampleRate, {
+          onProgress: (r) => setAudioProgress(r),
+          yieldFn: () => new Promise((resolve) => setTimeout(resolve, 0)),
+        });
+
+        setProject((p) => {
+          if (!p) return p;
+          const dur = p.duration || result.duration;
+          const hasUserEdits = p.timeline.some((e) => e.edited);
+          if (hasUserEdits) {
+            // ユーザー編集済みのタイムラインは崩さず、照合と情報だけ更新
+            const verified = verifyWithAudio(p.timeline, result.chords);
+            const needsReviewCount = verified.filter((e) => e.needsReview).length;
+            return {
+              ...p,
+              timeline: verified,
+              beatGrid: result.grid,
+              audioChords: result.chords,
+              audioFileName: file.name,
+              analysis: {
+                sourceCount: p.sources.length,
+                bpm: result.grid.bpm,
+                timingConfidence: result.grid.confidence >= 0.6 ? "high" : result.grid.confidence >= 0.3 ? "medium" : "low",
+                needsReviewCount,
+                message: `音源解析が完了しました。推定BPM: ${result.grid.bpm}。編集済みのコードはそのまま維持しています。`,
+              },
+            };
+          }
+          // 編集がなければ、実測グリッドで統合し直す
+          const out = integrate({
+            progression: p.progression ?? [],
+            sourceCount: p.sources.length,
+            duration: dur,
+            audioGrid: result.grid,
+            audioChords: result.chords,
+          });
+          return {
+            ...p,
+            duration: dur,
+            timeline: out.timeline,
+            beatGrid: out.grid,
+            audioChords: result.chords,
+            audioFileName: file.name,
+            analysis: out.summary,
+          };
+        });
+      } catch {
+        setError(
+          "音源ファイルの解析に失敗しました。対応形式 (mp3 / wav / m4a など) か確認してください。"
+        );
+      } finally {
+        setAudioProgress(null);
+      }
+    },
+    [project]
+  );
 
   /** タイムライン更新の共通入口 */
   const updateTimeline = useCallback((fn: (tl: ChordEvent[]) => ChordEvent[]) => {
@@ -157,31 +301,49 @@ export default function Home() {
   }, []);
 
   /** コード編集 (ユーザー確定扱いにする) */
-  const editChord = useCallback((id: string, patch: Partial<ChordEvent>) => {
-    updateTimeline((tl) =>
-      tl.map((e) =>
-        e.id === id ? { ...e, ...patch, edited: true, source: "user", confidence: 1 } : e
-      )
-    );
-  }, [updateTimeline]);
+  const editChord = useCallback(
+    (id: string, patch: Partial<ChordEvent>) => {
+      updateTimeline((tl) =>
+        tl.map((e) =>
+          e.id === id
+            ? { ...e, ...patch, edited: true, source: "manual", confidence: "high", needsReview: false }
+            : e
+        )
+      );
+    },
+    [updateTimeline]
+  );
 
-  /** タイムライン境界のドラッグ移動 */
-  const moveBoundary = useCallback((index: number, t: number) => {
-    updateTimeline((tl) => {
-      if (index <= 0 || index >= tl.length) return tl;
-      const prev = tl[index - 1];
-      const cur = tl[index];
-      const clamped = Math.max(prev.start + 0.1, Math.min(cur.end - 0.1, t));
-      const updated = [...tl];
-      updated[index - 1] = { ...prev, end: clamped, edited: true };
-      updated[index] = { ...cur, start: clamped, edited: true };
-      return updated;
-    });
-  }, [updateTimeline]);
+  /** グリッドスナップを適用した時刻 */
+  const snapped = useCallback(
+    (t: number) => snapTime(t, project?.beatGrid, snapMode),
+    [project?.beatGrid, snapMode]
+  );
 
-  const setting = useCallback(<K extends keyof Project["settings"]>(key: K, value: Project["settings"][K]) => {
-    setProject((p) => (p ? { ...p, settings: { ...p.settings, [key]: value } } : p));
-  }, []);
+  /** タイムライン境界のドラッグ移動 (スナップ適用) */
+  const moveBoundary = useCallback(
+    (index: number, t: number) => {
+      const st = snapped(t);
+      updateTimeline((tl) => {
+        if (index <= 0 || index >= tl.length) return tl;
+        const prev = tl[index - 1];
+        const cur = tl[index];
+        const clamped = Math.max(prev.start + 0.1, Math.min(cur.end - 0.1, st));
+        const updated = [...tl];
+        updated[index - 1] = { ...prev, end: clamped, edited: true };
+        updated[index] = { ...cur, start: clamped, edited: true };
+        return updated;
+      });
+    },
+    [updateTimeline, snapped]
+  );
+
+  const setting = useCallback(
+    <K extends keyof Project["settings"]>(key: K, value: Project["settings"][K]) => {
+      setProject((p) => (p ? { ...p, settings: { ...p.settings, [key]: value } } : p));
+    },
+    []
+  );
 
   const setLoop = useCallback((patch: Partial<Project["loop"]>) => {
     setProject((p) => (p ? { ...p, loop: { ...p.loop, ...patch } } : p));
@@ -189,20 +351,20 @@ export default function Home() {
 
   /** 「ここで次のコード」 */
   const splitAtNow = useCallback(() => {
-    const t = engine.timeRef.current;
+    const t = snapped(engine.timeRef.current);
     updateTimeline((tl) => splitAt(tl, t));
-  }, [engine.timeRef, updateTimeline]);
+  }, [engine.timeRef, updateTimeline, snapped]);
 
   /** 現在位置にコードを追加 */
   const addAtNow = useCallback(() => {
-    const t = engine.timeRef.current;
+    const t = snapped(engine.timeRef.current);
     updateTimeline((tl) => addChordAt(tl, t, "C"));
-  }, [engine.timeRef, updateTimeline]);
+  }, [engine.timeRef, updateTimeline, snapped]);
 
-  /** 選択コードの開始/終了を現在位置に */
+  /** 選択コードの開始/終了を現在位置に (スナップ適用) */
   const setStartToNow = useCallback(() => {
     if (!selectedId) return;
-    const t = engine.timeRef.current;
+    const t = snapped(engine.timeRef.current);
     updateTimeline((tl) => {
       const idx = tl.findIndex((e) => e.id === selectedId);
       if (idx < 0) return tl;
@@ -213,11 +375,11 @@ export default function Home() {
       }
       return updated;
     });
-  }, [selectedId, engine.timeRef, updateTimeline]);
+  }, [selectedId, engine.timeRef, updateTimeline, snapped]);
 
   const setEndToNow = useCallback(() => {
     if (!selectedId) return;
-    const t = engine.timeRef.current;
+    const t = snapped(engine.timeRef.current);
     updateTimeline((tl) => {
       const idx = tl.findIndex((e) => e.id === selectedId);
       if (idx < 0) return tl;
@@ -228,7 +390,23 @@ export default function Home() {
       }
       return updated;
     });
-  }, [selectedId, engine.timeRef, updateTimeline]);
+  }, [selectedId, engine.timeRef, updateTimeline, snapped]);
+
+  /** 全コードを前後にずらす (タイミング全体補正) */
+  const shiftAll = useCallback(
+    (delta: number) => {
+      updateTimeline((tl) => shiftTimeline(tl, delta));
+    },
+    [updateTimeline]
+  );
+
+  const manualSave = useCallback(() => {
+    if (!project) return;
+    saveProject(project);
+    setSavedFlash(true);
+    setTimeout(() => setSavedFlash(false), 1500);
+    setSavedProjects(listProjects());
+  }, [project]);
 
   // キーボードショートカット
   useEffect(() => {
@@ -249,34 +427,40 @@ export default function Home() {
           e.preventDefault();
           addAtNow();
           break;
-        case "[":
+        case "b": case "B": case "[":
           setLoop({ start: engine.timeRef.current });
           break;
-        case "]":
+        case "e": case "E": case "]":
           setLoop({ end: engine.timeRef.current });
           break;
         case "l": case "L":
           setLoop({ enabled: !loop.enabled });
           break;
         case "s": case "S":
+          e.preventDefault();
+          manualSave();
+          break;
+        case "i": case "I":
           setStartToNow();
           break;
-        case "e": case "E":
+        case "o": case "O":
           setEndToNow();
           break;
         case "ArrowLeft":
           e.preventDefault();
-          engine.seek(engine.timeRef.current - 2);
+          if (e.shiftKey) shiftAll(-0.1);
+          else engine.seek(engine.timeRef.current - 2);
           break;
         case "ArrowRight":
           e.preventDefault();
-          engine.seek(engine.timeRef.current + 2);
+          if (e.shiftKey) shiftAll(0.1);
+          else engine.seek(engine.timeRef.current + 2);
           break;
       }
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [project, loop.enabled, engine, splitAtNow, addAtNow, setLoop, setStartToNow, setEndToNow]);
+  }, [project, loop.enabled, engine, splitAtNow, addAtNow, setLoop, setStartToNow, setEndToNow, shiftAll, manualSave]);
 
   // 表示用ボイシング (現在コード)
   const voicing = useMemo(() => {
@@ -285,6 +469,7 @@ export default function Home() {
   }, [currentChord]);
 
   const analyzing = analyzeStep >= 0;
+  const noChords = project !== null && timeline.length === 0 && !analyzing;
 
   return (
     <main className="app">
@@ -303,11 +488,12 @@ export default function Home() {
             {analyzing ? "解析中…" : "解析する"}
           </button>
           {project && (
-            <button className="btn" onClick={() => void analyze(true)} disabled={analyzing} title="保存内容を無視して最初から解析し直す">
+            <button className="btn" onClick={() => void analyze({ force: true })} disabled={analyzing} title="保存内容を無視して最初から解析し直す">
               再解析
             </button>
           )}
         </div>
+        <ThemeToggle />
       </header>
 
       {analyzing && (
@@ -323,19 +509,25 @@ export default function Home() {
         </div>
       )}
 
-      {error && <div className="alert error">{error}</div>}
-      {notice && !analyzing && (
-        <div className="alert notice">
-          {notice}
-          <button className="alert-close" onClick={() => setNotice("")}>×</button>
+      {audioProgress !== null && (
+        <div className="analyze-progress audio-progress">
+          <div className="spinner" />
+          <div className="audio-progress-body">
+            <p>BPM・拍位置・コード候補を解析中… {Math.round(audioProgress * 100)}%</p>
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${audioProgress * 100}%` }} />
+            </div>
+          </div>
         </div>
       )}
+
+      {error && <div className="alert error">{error}</div>}
 
       {!project && !analyzing && (
         <section className="start-screen">
           <p className="lead">
-            YouTubeのJ-POPリンクを貼ると、コード進行を自動推定して、<br />
-            原曲と同期しながら「今鳴っているコード・ベース音・ピアノの押さえ方」を表示します。
+            YouTubeのJ-POPリンクを貼ると、外部コード情報や音源解析に基づくコード候補を表示し、<br />
+            原曲と同期しながら「今鳴っているコード・ベース音・ピアノの押さえ方」を確認できます。
           </p>
           {savedProjects.length > 0 && (
             <div className="project-list">
@@ -381,17 +573,94 @@ export default function Home() {
               <p className="muted small">{project.videoTitle} — {project.channelName}</p>
             </div>
             <div className="song-actions">
-              <button
-                className="btn"
-                onClick={() => { saveProject(project); setSavedFlash(true); setTimeout(() => setSavedFlash(false), 1500); setSavedProjects(listProjects()); }}
-              >
+              <button className="btn" onClick={manualSave} title="ショートカット: S">
                 {savedFlash ? "✓ 保存しました" : "保存"}
               </button>
-              <button className="btn" onClick={() => { engine.pause(); setProject(null); setSelectedId(null); setNotice(""); }}>
+              <button className="btn" onClick={() => { engine.pause(); setProject(null); setSelectedId(null); }}>
                 閉じる
               </button>
             </div>
           </section>
+
+          {/* 解析結果サマリー */}
+          {project.analysis && !analyzing && (
+            <div className={`summary-card ${timeline.length === 0 ? "summary-warn" : ""}`}>
+              <p className="summary-message">{project.analysis.message}</p>
+              <div className="summary-stats">
+                {project.analysis.sourceCount > 0 && (
+                  <span className="stat-chip">外部コードソース: {project.analysis.sourceCount}件</span>
+                )}
+                {project.beatGrid?.source === "audio" && (
+                  <>
+                    <span className="stat-chip">推定BPM: {project.beatGrid.bpm}</span>
+                    <span className="stat-chip">
+                      拍グリッド: {formatTime(project.beatGrid.firstDownbeat)} から
+                    </span>
+                  </>
+                )}
+                {timeline.length > 0 && (
+                  <span className="stat-chip">タイミング信頼度: {project.analysis.timingConfidence}</span>
+                )}
+                {project.analysis.needsReviewCount > 0 && (
+                  <span className="stat-chip stat-warn">⚠ 要確認: {project.analysis.needsReviewCount}箇所</span>
+                )}
+                {project.audioFileName && (
+                  <span className="stat-chip">🎵 {project.audioFileName}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* コード候補が出せなかった場合の案内 */}
+          {noChords && (
+            <div className="guidance-panel">
+              <h3>コード候補を表示できません</h3>
+              <p className="muted">
+                根拠のあるコード情報が見つからなかったため、コード進行の自動生成は行いません。
+                以下のいずれかで続けてください。
+              </p>
+              <div className="guidance-actions">
+                <div className="guidance-item">
+                  <button
+                    className="btn primary"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={audioProgress !== null}
+                  >
+                    🎵 音源ファイルをアップロードして解析
+                  </button>
+                  <p className="muted small">BPM・拍グリッド・コード候補を曲の音から推定します (mp3 / wav / m4a)</p>
+                </div>
+                <div className="guidance-item">
+                  <form
+                    className="research-form"
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void analyze({ force: true, title: searchTitle, artist: searchArtist });
+                    }}
+                  >
+                    <input
+                      value={searchTitle}
+                      onChange={(e) => setSearchTitle(e.target.value)}
+                      placeholder="曲名"
+                    />
+                    <input
+                      value={searchArtist}
+                      onChange={(e) => setSearchArtist(e.target.value)}
+                      placeholder="アーティスト名"
+                    />
+                    <button className="btn" type="submit" disabled={analyzing || !searchTitle.trim()}>
+                      🔍 修正して再検索
+                    </button>
+                  </form>
+                  <p className="muted small">曲名・アーティスト名の推定が違っている場合はここで直せます</p>
+                </div>
+                <div className="guidance-item">
+                  <button className="btn" onClick={addAtNow}>＋ 手動でコードを追加</button>
+                  <p className="muted small">再生しながら現在位置にコードを置いていけます (Aキー)</p>
+                </div>
+              </div>
+            </div>
+          )}
 
           {project.sources.length > 0 && (
             <details className="sources-detail">
@@ -431,6 +700,14 @@ export default function Home() {
                       {label}
                     </button>
                   ))}
+                  <button
+                    className="btn small upload-btn"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={audioProgress !== null}
+                    title="音源ファイルからBPM・拍グリッド・コード候補を解析します"
+                  >
+                    🎵 音源を解析
+                  </button>
                 </div>
                 <div className="transport-row">
                   <button className="btn primary" onClick={engine.togglePlay}>
@@ -465,10 +742,10 @@ export default function Home() {
                   >
                     {loop.enabled ? "ON" : "OFF"}
                   </button>
-                  <button className="btn small" onClick={() => setLoop({ start: engine.timeRef.current })} title="ショートカット: [">
+                  <button className="btn small" onClick={() => setLoop({ start: engine.timeRef.current })} title="ショートカット: B">
                     開始=現在
                   </button>
-                  <button className="btn small" onClick={() => setLoop({ end: engine.timeRef.current })} title="ショートカット: ]">
+                  <button className="btn small" onClick={() => setLoop({ end: engine.timeRef.current })} title="ショートカット: E">
                     終了=現在
                   </button>
                   <input
@@ -500,10 +777,33 @@ export default function Home() {
           <div className="timeline-actions">
             <button className="btn" onClick={addAtNow} title="ショートカット: A">＋ 現在位置にコード追加</button>
             <button className="btn" onClick={splitAtNow} title="ショートカット: N / Enter">✂ ここで次のコード</button>
-            <span className="muted small shortcut-hint">
-              Space: 再生/停止 ・ N: コード切替位置を打つ ・ [ ]: ループ区間 ・ S/E: 選択コードの開始/終了=現在 ・ ←→: 2秒移動
+            <span className="snap-group">
+              <span className="label">スナップ</span>
+              {(
+                [["off", "OFF"], ["beat", "拍"], ["bar", "小節"]] as [SnapMode, string][]
+              ).map(([m, label]) => (
+                <button
+                  key={m}
+                  className={`btn small ${snapMode === m ? "active" : ""}`}
+                  onClick={() => setting("snapMode", m)}
+                  disabled={!grid && m !== "off"}
+                  title={!grid && m !== "off" ? "グリッドがありません (音源を解析すると使えます)" : ""}
+                >
+                  {label}
+                </button>
+              ))}
+            </span>
+            <span className="shift-group">
+              <span className="label">全体シフト</span>
+              <button className="btn small" onClick={() => shiftAll(-0.5)}>−0.5s</button>
+              <button className="btn small" onClick={() => shiftAll(-0.1)} title="Shift+←">−0.1s</button>
+              <button className="btn small" onClick={() => shiftAll(0.1)} title="Shift+→">＋0.1s</button>
+              <button className="btn small" onClick={() => shiftAll(0.5)}>＋0.5s</button>
             </span>
           </div>
+          <p className="muted small shortcut-hint">
+            Space: 再生/停止 ・ N: ここで次のコード ・ A: コード追加 ・ B/E: ループ開始/終了 ・ L: ループON/OFF ・ S: 保存 ・ I/O: 選択コードの開始/終了=現在 ・ ←→: 2秒移動 ・ Shift+←→: 全体シフト
+          </p>
 
           <Timeline
             timeline={timeline}
@@ -512,6 +812,7 @@ export default function Home() {
             chordIndex={engine.chordIndex}
             loop={loop}
             selectedId={selectedId}
+            grid={grid}
             onSeek={engine.seek}
             onSelect={setSelectedId}
             onMoveBoundary={moveBoundary}
@@ -531,11 +832,23 @@ export default function Home() {
               onAudition={(part) => engine.audition(selectedChord, part)}
             />
           )}
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) void handleAudioFile(file);
+              e.target.value = "";
+            }}
+          />
         </>
       )}
 
       <footer className="footer muted small">
-        コード候補は外部コード譜・推定に基づく参考情報です。タイミングは目安なので、再生しながら調整してください。
+        コード候補は外部コード譜・音源解析に基づく参考情報です。信頼度と要確認マークを目安に、再生しながら確認・修正してください。
       </footer>
     </main>
   );

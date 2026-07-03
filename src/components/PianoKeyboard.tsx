@@ -45,9 +45,9 @@ export default function PianoKeyboard({ leftNotes, rightNotes }: Props) {
   }
 
   const fillFor = (midi: number, isBlack: boolean): string => {
-    if (leftSet.has(midi)) return midi === bassNote ? "#2563eb" : "#3b82f6";
-    if (rightSet.has(midi)) return "#10b981";
-    return isBlack ? "#1f2430" : "#f8fafc";
+    if (leftSet.has(midi)) return midi === bassNote ? "var(--hl-bass)" : "var(--hl-left)";
+    if (rightSet.has(midi)) return "var(--hl-right)";
+    return isBlack ? "var(--black-key)" : "var(--white-key)";
   };
 
   const labeled = [...leftNotes, ...rightNotes];
@@ -68,7 +68,7 @@ export default function PianoKeyboard({ leftNotes, rightNotes }: Props) {
             width={WHITE_W}
             height={WHITE_H}
             fill={fillFor(k.midi, false)}
-            stroke="#475069"
+            stroke="var(--white-key-stroke)"
             strokeWidth={1}
             rx={2}
           />
@@ -81,7 +81,7 @@ export default function PianoKeyboard({ leftNotes, rightNotes }: Props) {
             width={BLACK_W}
             height={BLACK_H}
             fill={fillFor(k.midi, true)}
-            stroke="#0c0f16"
+            stroke="var(--black-key-stroke)"
             strokeWidth={1}
             rx={2}
           />
@@ -90,7 +90,7 @@ export default function PianoKeyboard({ leftNotes, rightNotes }: Props) {
         {whiteKeys
           .filter((k) => k.midi % 12 === 0)
           .map((k) => (
-            <text key={`oct-${k.midi}`} x={k.x + 4} y={WHITE_H + 13} fontSize={9} fill="#64748b">
+            <text key={`oct-${k.midi}`} x={k.x + 4} y={WHITE_H + 13} fontSize={9} fill="var(--muted)">
               {midiToName(k.midi)}
             </text>
           ))}
@@ -105,14 +105,14 @@ export default function PianoKeyboard({ leftNotes, rightNotes }: Props) {
           const cy = isBlack ? BLACK_H - 12 : WHITE_H - 14;
           return (
             <g key={`lbl-${m}`}>
-              <circle cx={cx} cy={cy} r={8} fill="rgba(255,255,255,0.92)" />
+              <circle cx={cx} cy={cy} r={8} fill="var(--key-label-bg)" />
               <text
                 x={cx}
                 y={cy + 3}
                 fontSize={8}
                 fontWeight={700}
                 textAnchor="middle"
-                fill="#111827"
+                fill="var(--key-label-text)"
               >
                 {midiToName(m).replace(/\d+$/, "")}
               </text>

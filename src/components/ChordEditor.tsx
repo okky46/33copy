@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import type { ChordEvent } from "@/lib/types";
 import { parseChord } from "@/lib/chords";
-import { sourceBadge } from "./ChordDisplay";
+import { confidenceBadge, sourceBadge } from "./ChordDisplay";
 
 const ROOTS = ["C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab", "A", "A#", "Bb", "B"];
 const QUALITIES = ["", "m", "7", "maj7", "m7", "6", "m6", "sus4", "sus2", "add9", "dim", "aug", "m7b5", "9", "m9", "maj9", "7sus4", "dim7"];
@@ -30,6 +30,7 @@ export default function ChordEditor({
   const parsed = parseChord(nameInput);
   const nameValid = parsed.valid;
   const badge = sourceBadge(chord);
+  const conf = confidenceBadge(chord);
 
   /** コード名確定: パースしてroot/quality/bassも更新 */
   const commitName = (raw: string) => {
@@ -50,7 +51,11 @@ export default function ChordEditor({
       <div className="editor-head">
         <h3>コード編集</h3>
         <span className={`badge ${badge.cls}`}>{badge.label}</span>
-        <span className="muted small">信頼度 {(chord.confidence * 100) | 0}%</span>
+        <span className={`badge ${conf.cls}`}>{conf.label}</span>
+        {chord.needsReview && <span className="badge badge-review">⚠ 要確認</span>}
+        {chord.evidence?.notes && chord.evidence.notes.length > 0 && (
+          <span className="muted small">{chord.evidence.notes.join(" / ")}</span>
+        )}
         <button className="btn small danger" onClick={onDelete}>削除</button>
       </div>
 
