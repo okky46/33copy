@@ -12,11 +12,28 @@ interface Props {
 }
 
 export function sourceBadge(ev: ChordEvent): { label: string; cls: string } {
-  if (ev.edited || ev.source === "user") return { label: "手動確定", cls: "badge-user" };
-  if (ev.source === "consensus")
-    return { label: `${ev.sourceCount}ソース一致`, cls: "badge-consensus" };
-  if (ev.source === "external") return { label: "外部コード譜", cls: "badge-external" };
-  return { label: "仮置き", cls: "badge-fallback" };
+  if (ev.edited || ev.source === "manual") return { label: "手動確定", cls: "badge-user" };
+  if (ev.source === "merged") {
+    const n = ev.evidence?.externalSources?.length ?? 2;
+    return { label: `${n}ソース一致`, cls: "badge-consensus" };
+  }
+  if (ev.source === "audio-analysis") return { label: "音源解析", cls: "badge-audio" };
+  if (ev.source === "saved") return { label: "保存済み", cls: "badge-user" };
+  return { label: "外部コード譜", cls: "badge-external" };
+}
+
+const CONFIDENCE_LABEL: Record<ChordEvent["confidence"], string> = {
+  high: "信頼度: 高",
+  medium: "信頼度: 中",
+  low: "信頼度: 低",
+  unknown: "信頼度: 不明",
+};
+
+export function confidenceBadge(ev: ChordEvent): { label: string; cls: string } {
+  return {
+    label: CONFIDENCE_LABEL[ev.confidence],
+    cls: `badge-conf-${ev.confidence}`,
+  };
 }
 
 export default function ChordDisplay({ chord, nextChord, onAudition }: Props) {
@@ -32,15 +49,22 @@ export default function ChordDisplay({ chord, nextChord, onAudition }: Props) {
   const parsed = parseChord(chord.name);
   const v = voiceChord(parsed);
   const badge = sourceBadge(chord);
+  const conf = confidenceBadge(chord);
 
   return (
     <div className="chord-card">
       <div className="chord-head">
         <div className="chord-name-big">{chord.name}</div>
         <div className="chord-meta">
-          <span className={`badge ${badge.cls}`} title={`信頼度 ${(chord.confidence * 100) | 0}%`}>
-            {badge.label}
+          <span className={`badge ${badge.cls}`}>{badge.label}</span>
+          <span className={`badge ${conf.cls}`} title={chord.evidence?.notes?.join(" / ")}>
+            {conf.label}
           </span>
+          {chord.needsReview && (
+            <span className="badge badge-review" title={chord.evidence?.notes?.join(" / ") || "音源解析と矛盾する可能性があります"}>
+              ⚠ 要確認
+            </span>
+          )}
           {nextChord && (
             <span className="next-chord">
               次: <b>{nextChord.name}</b>

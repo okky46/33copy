@@ -4,7 +4,7 @@
 // 境界ドラッグでタイミング調整・ループ区間表示・再生カーソル
 
 import { useEffect, useRef, useState } from "react";
-import type { ChordEvent, LoopRange } from "@/lib/types";
+import type { BeatGrid, ChordEvent, LoopRange } from "@/lib/types";
 import { chordColor, parseChord } from "@/lib/chords";
 
 interface Props {
@@ -14,6 +14,8 @@ interface Props {
   chordIndex: number;
   loop: LoopRange;
   selectedId: string | null;
+  /** 拍・小節グリッド (あれば描画) */
+  grid?: BeatGrid | null;
   onSeek: (t: number) => void;
   onSelect: (id: string | null) => void;
   /** コードi-1とiの境界時刻を変更 (i=0はコード0のstart) */
@@ -21,7 +23,7 @@ interface Props {
 }
 
 export default function Timeline({
-  timeline, duration, currentTime, chordIndex, loop, selectedId,
+  timeline, duration, currentTime, chordIndex, loop, selectedId, grid,
   onSeek, onSelect, onMoveBoundary,
 }: Props) {
   const [pxPerSec, setPxPerSec] = useState(14);
@@ -84,6 +86,24 @@ export default function Timeline({
             onSelect(null);
           }}
         >
+          {/* 拍・小節グリッド (拍線はズームが十分なときのみ描画) */}
+          {grid && grid.beats.length > 0 && (() => {
+            const downbeatSet = new Set(grid.downbeats);
+            const showBeats = (60 / grid.bpm) * pxPerSec >= 7;
+            return (
+              <>
+                {showBeats &&
+                  grid.beats.map((t) =>
+                    downbeatSet.has(t) ? null : (
+                      <div key={`b-${t}`} className="grid-beat" style={{ left: t * pxPerSec }} />
+                    )
+                  )}
+                {grid.downbeats.map((t) => (
+                  <div key={`d-${t}`} className="grid-bar" style={{ left: t * pxPerSec }} />
+                ))}
+              </>
+            );
+          })()}
           {/* ループ区間 */}
           {loop.enabled && loop.end > loop.start && (
             <div
@@ -103,7 +123,9 @@ export default function Timeline({
                   "chord-block" +
                   (i === chordIndex ? " current" : "") +
                   (ev.id === selectedId ? " selected" : "") +
-                  (ev.edited ? " edited" : "")
+                  (ev.edited ? " edited" : "") +
+                  (ev.needsReview ? " review" : "") +
+                  (ev.confidence === "low" || ev.confidence === "unknown" ? " low-conf" : "")
                 }
                 style={{
                   left: ev.start * pxPerSec,
@@ -117,7 +139,9 @@ export default function Timeline({
                   onSeek(ev.start + 0.01);
                 }}
               >
-                <span className="chord-block-label">{ev.name}</span>
+                <span className="chord-block-label">
+                  {ev.needsReview ? "⚠" : ""}{ev.name}
+                </span>
                 {ev.section && i > 0 && timeline[i - 1].section !== ev.section && (
                   <span className="section-label">{ev.section}</span>
                 )}

@@ -72,20 +72,20 @@ export function buildConsensus(
 
   const base = pool[bestIdx];
   const others = pool.filter((s) => s !== base);
-  const otherVocabs = others.map((s) => vocab(s.chords));
+  const otherVocabs = others.map((s) => ({ provider: s.provider, vocab: vocab(s.chords) }));
 
   const baseQuality = Math.min(0.85, 0.45 + base.score * 0.3 + agreement[bestIdx] * 0.3);
 
   return base.chords.map((c) => {
     const norm = parseChord(c.name).name;
-    const matchCount = otherVocabs.filter((v) => v.has(norm)).length;
-    const agreeRatio = others.length > 0 ? matchCount / others.length : 0;
+    const matched = otherVocabs.filter((v) => v.vocab.has(norm));
+    const agreeRatio = others.length > 0 ? matched.length / others.length : 0;
     return {
       name: c.name,
       section: c.section,
-      sourceCount: 1 + matchCount,
-      confidence: Math.min(0.95, baseQuality * (0.7 + 0.3 * agreeRatio) + agreeRatio * 0.15),
-      source: matchCount > 0 ? ("consensus" as const) : ("external" as const),
+      sourceCount: 1 + matched.length,
+      providers: [base.provider, ...matched.map((v) => v.provider)],
+      score: Math.min(0.95, baseQuality * (0.7 + 0.3 * agreeRatio) + agreeRatio * 0.15),
     };
   });
 }
