@@ -54,7 +54,7 @@ export function integrate(input: IntegrationInput): IntegrationOutput {
         timingConfidence: "low",
         needsReviewCount: 0,
         message:
-          "十分なコード候補を取得できませんでした。音源ファイルをアップロードして解析するか、手動でコードを追加してください。",
+          "十分なコード候補を取得できませんでした。曲名・アーティスト名を修正して再検索するか、手動でコードを追加してください。音源ファイルをアップロードして解析することもできます。",
       },
     };
   }

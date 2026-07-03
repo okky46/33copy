@@ -1,20 +1,33 @@
 // コアロジックのユニットテスト (npm test で実行)
 // 依存を増やさないため素朴なassertベース
 
-import { parseChord, voiceChord, midiToName, CHORD_TOKEN_RE } from "../src/lib/chords";
-import { guessSong } from "../src/lib/titleParse";
+import {
+  parseChord,
+  voiceChord,
+  midiToName,
+  transposeChordName,
+  CHORD_TOKEN_RE,
+} from "../src/lib/chords";
+import { buildQueries, guessSong, nameVariants } from "../src/lib/titleParse";
 import {
   chordIndexAt,
   makeAssumedGrid,
   normalizeTimeline,
   placeOnGrid,
+  rebuildGrid,
   shiftTimeline,
   snapTime,
   splitAt,
 } from "../src/lib/timeline";
 import { integrate, verifyWithAudio } from "../src/lib/integrate";
-import { extractChordsFromHtml } from "../src/lib/chordSources/extract";
-import { buildConsensus } from "../src/lib/chordSources/consensus";
+import {
+  extractChordsFromHtml,
+  extractChordsFromScripts,
+  extractPageMeta,
+} from "../src/lib/chordSources/extract";
+import { bestTransposition, buildConsensus } from "../src/lib/chordSources/consensus";
+import { scoreHit } from "../src/lib/chordSources/scoring";
+import { parseBingHtml, parseDuckDuckGoHtml } from "../src/lib/chordSources/webSearch";
 import { analyzeAudio } from "../src/lib/audioAnalysis/analyze";
 import { extractVideoId } from "../src/lib/youtube";
 import type { AnalyzeResult } from "../src/lib/types";
@@ -187,6 +200,149 @@ ok(consensus.length === 8, "consensus uses best source");
 const fChord = consensus.find((c) => c.name === "F");
 ok(!!fChord && fChord.sourceCount === 2 && fChord.providers.length === 2, "consensus counts providers");
 ok(buildConsensus([]).length === 0, "consensus empty for no sources");
+
+// ---- コードパース拡張 (♭ / N.C. / 移調) ----
+ok(parseChord("B♭m").valid && parseChord("B♭m").rootPc === 10, "B♭m parse");
+ok(parseChord("E♭m").rootPc === 3, "E♭m parse");
+const nc = parseChord("N.C.");
+ok(nc.valid && nc.isNoChord === true, "N.C. parse");
+eq(voiceChord(nc), { left: [], right: [] }, "N.C. no voicing");
+eq(transposeChordName("Am7", 2), "Bm7", "transpose Am7 +2");
+eq(transposeChordName("G/B", 1), "G#/C", "transpose slash chord");
+eq(transposeChordName("C", 0), "C", "transpose 0 is identity");
+eq(transposeChordName("N.C.", 5), "N.C.", "transpose N.C.");
+
+// ---- 表記バリアントとクエリ生成 ----
+const vars = nameVariants("チョコレート メランコリー");
+ok(vars.includes("チョコレートメランコリー"), "variant without space");
+ok(nameVariants("≠ME").length >= 1, "variant for symbol artist");
+const queries = buildQueries("チョコレートメランコリー", "≠ME");
+ok(queries.some((q) => q.includes("ギターコード")), "queries include ギターコード");
+ok(queries.some((q) => q.includes("弾き語り")), "queries include 弾き語り");
+ok(queries.some((q) => /chords?/.test(q)), "queries include chords");
+ok(queries.length >= 6, `multiple queries generated (${queries.length})`);
+
+// ---- 検索結果スコアリング ----
+const ufretHit = {
+  url: "https://www.ufret.jp/song.php?data=12345",
+  title: "チョコレートメランコリー / ≠ME ギターコード譜 - U-FRET",
+  snippet: "≠MEの「チョコレートメランコリー」のギターコード譜",
+  searchProvider: "DuckDuckGo",
+};
+const sUfret = scoreHit(ufretHit, "チョコレートメランコリー", "≠ME");
+ok(sUfret.accepted && sUfret.score >= 3, `ufret hit accepted (score ${sUfret.score.toFixed(1)})`);
+ok(sUfret.reasons.some((r) => r.includes("コードサイト")), "ufret domain recognized");
+
+const lyricsHit = {
+  url: "https://www.uta-net.com/song/999999/",
+  title: "チョコレートメランコリー 歌詞 - 歌ネット",
+  snippet: "≠MEの「チョコレートメランコリー」歌詞ページ",
+  searchProvider: "DuckDuckGo",
+};
+const sLyrics = scoreHit(lyricsHit, "チョコレートメランコリー", "≠ME");
+ok(!sLyrics.accepted, `lyrics page rejected (score ${sLyrics.score.toFixed(1)})`);
+
+const newsHit = {
+  url: "https://example-news.com/article/123",
+  title: "≠ME 新曲リリース決定のニュース",
+  snippet: "アイドルグループ≠MEが新曲をリリース",
+  searchProvider: "Bing",
+};
+ok(!scoreHit(newsHit, "チョコレートメランコリー", "≠ME").accepted, "news page rejected");
+
+// ---- 抽出拡張 (全角 / ♭ / N.C. / カポ / script埋め込み) ----
+const htmlFlat = `<pre>A♭ B♭m E♭ Fm A♭ D♭ E♭ Cm A♭ B♭m</pre>`;
+const flat = extractChordsFromHtml(htmlFlat);
+ok(flat.length === 10 && flat[1].name === "B♭m", `flat chords extracted (${flat.length})`);
+
+const htmlZenkaku = `<p>Ａｍ７ Ｇ Ｆmaj7 Ｃ Ａｍ７ Ｇ Ｆ Ｃ</p>`;
+const zen = extractChordsFromHtml(htmlZenkaku);
+ok(zen.length === 8 && zen[0].name === "Am7", `zenkaku normalized (${zen[0]?.name})`);
+
+const htmlNc = `<p>C G N.C. Am F G C N.C.</p>`;
+ok(extractChordsFromHtml(htmlNc).filter((c) => c.name === "N.C.").length === 2, "N.C. extracted");
+
+eq(extractPageMeta("<p>カポ2で弾けます</p>").capo, 2, "capo detection");
+eq(extractPageMeta("<p>Capo: 3</p>").capo, 3, "capo detection en");
+eq(extractPageMeta("<p>原曲キー: E♭</p>").keyLabel, "E♭", "key detection");
+
+// U-FRET風: コードがJS文字列として埋め込まれているケース
+const chordArr = ["C", "G/B", "Am7", "Em", "F", "C/E", "Dm7", "G7", "C", "G", "Am", "F", "C", "G", "F", "G", "Am7", "G", "F", "C"];
+const htmlScript = `<html><body><div id="app"></div><script>var chords=[${chordArr.map((c) => `"${c}"`).join(",")}];render(chords);</script></body></html>`;
+const scriptChords = extractChordsFromScripts(htmlScript);
+ok(scriptChords.length === 20, `script-embedded chords extracted (${scriptChords.length})`);
+ok(scriptChords[1].name === "G/B", "script chords keep slash");
+
+// scriptに歌詞などコード以外が多い場合は誤検出しない
+const htmlNoisy = `<script>var w=["hello","world","foo","bar","baz","qux","C","G"];</script>`;
+ok(extractChordsFromScripts(htmlNoisy).length === 0, "noisy script not misdetected");
+
+// ---- 検索結果HTMLのパース (フィクスチャ) ----
+const ddgHtml = `
+<div class="result">
+  <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.ufret.jp%2Fsong.php%3Fdata%3D12345&rut=abc">テスト曲 ギターコード - U-FRET</a>
+  <a class="result__snippet" href="#">テスト曲のギターコード譜。初心者向け簡単コードも。</a>
+</div>
+<div class="result">
+  <a rel="nofollow" class="result__a" href="https://ja.chordwiki.org/wiki/%E3%83%86%E3%82%B9%E3%83%88">テスト曲 - ChordWiki</a>
+</div>`;
+const ddgHits = parseDuckDuckGoHtml(ddgHtml);
+ok(ddgHits.length === 2, `ddg parse hits (${ddgHits.length})`);
+eq(ddgHits[0].url, "https://www.ufret.jp/song.php?data=12345", "ddg uddg redirect expanded");
+ok(ddgHits[0].title.includes("U-FRET"), "ddg title extracted");
+ok(ddgHits[0].snippet.includes("コード譜"), "ddg snippet extracted");
+
+const bingHtml = `
+<ol id="b_results">
+<li class="b_algo"><h2><a href="https://gakufu.gakki.me/m/data/N12345.html">テスト曲 コード譜 - 楽器.me</a></h2><div class="b_caption"><p>テスト曲のコード譜を掲載。</p></div></li>
+<li class="b_algo"><h2><a href="https://www.uta-net.com/song/1/">テスト曲 歌詞</a></h2><p>歌詞ページ</p></li>
+</ol>`;
+const bingHits = parseBingHtml(bingHtml);
+ok(bingHits.length === 2, `bing parse hits (${bingHits.length})`);
+eq(bingHits[0].url, "https://gakufu.gakki.me/m/data/N12345.html", "bing url extracted");
+ok(bingHits[0].snippet.includes("コード譜"), "bing snippet extracted");
+
+// ---- 移調を考慮したコンセンサス ----
+const progA = ["C", "G", "Am", "Em", "F", "C", "F", "G", "C", "G", "Am", "F"];
+const srcOrig = {
+  provider: "ufret.jp", url: "http://u", pageTitle: "テスト曲 コード", score: 0.8,
+  chords: progA.map((name) => ({ name })),
+};
+// 同じ進行を+2移調 (キー違いソースの想定)
+const srcTransposed = {
+  provider: "gakki.me", url: "http://g", pageTitle: "テスト曲 コード譜", score: 0.7,
+  chords: progA.map((name) => ({ name: transposeChordName(name, 2) })),
+};
+const bt = bestTransposition(srcOrig, srcTransposed);
+ok(bt.k === 10 && bt.similarity > 0.9, `bestTransposition detects key diff (k=${bt.k}, sim=${bt.similarity.toFixed(2)})`);
+
+const consensusT = buildConsensus([srcOrig, srcTransposed]);
+ok(consensusT.every((c) => c.sourceCount === 2), "transposed source agrees after correction");
+ok(consensusT.every((c) => !c.disputed), "no dispute after key correction");
+
+// カポ補正: カポ2表記 (実音より2半音低く書かれている) → +2補正で一致
+const srcCapo = {
+  provider: "capo-site", url: "http://c", pageTitle: "テスト曲 コード", score: 0.7, capo: 2,
+  chords: progA.map((name) => transposeChordName(name, -2)).map((name) => ({ name })),
+};
+const consensusCapo = buildConsensus([srcOrig, srcCapo]);
+ok(consensusCapo.every((c) => c.sourceCount === 2), "capo source agrees after correction");
+
+// 全く違うソース → disputed
+const srcDifferent = {
+  provider: "other", url: "http://d", pageTitle: "テスト曲", score: 0.5,
+  chords: ["Db", "Ab7", "Bbm7", "Gb7", "Db", "Ebm7", "Ab7", "Db", "Gb", "Ab7", "Bbm", "Ebm"].map((name) => ({ name })),
+};
+const consensusD = buildConsensus([srcOrig, srcDifferent]);
+ok(consensusD.some((c) => c.disputed), "conflicting sources mark disputed");
+
+// ---- rebuildGrid (BPM手動変更・小節頭合わせ) ----
+const manualGrid = rebuildGrid(120, 3, 60);
+ok(!!manualGrid && manualGrid.bpm === 120, "rebuildGrid bpm");
+ok(!!manualGrid && manualGrid.downbeats.includes(3), "firstDownbeat is a downbeat");
+ok(!!manualGrid && manualGrid.downbeats[0] === 1 || manualGrid!.downbeats[0] === 3 - 2, `backward extrapolation (${manualGrid?.downbeats[0]})`);
+ok(!!manualGrid && manualGrid.beats.every((b) => b >= 0), "no negative beats");
+ok(rebuildGrid(10, 0, 60) === null, "rejects absurd bpm");
 
 // ---- 音源解析 (合成音声: 120BPM、CとFのコードを1小節ごとに交互) ----
 async function testAudioAnalysis() {

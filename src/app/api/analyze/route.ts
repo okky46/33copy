@@ -3,13 +3,14 @@
 //
 // 品質ルール: 外部コード譜が見つからなければ progression は空で返す。
 // 曲と無関係な定番進行 (カノン進行など) の仮置きは行わない。
+// 検索の動作確認のため、クエリ・候補URL・採否理由などのデバッグ情報を必ず返す。
 
 import { NextRequest, NextResponse } from "next/server";
 import { extractVideoId, fetchVideoInfo } from "@/lib/youtube";
 import { buildQueries, guessSong } from "@/lib/titleParse";
-import { searchChordWiki, searchWeb } from "@/lib/chordSources/providers";
+import { collectSources } from "@/lib/chordSources/providers";
 import { buildConsensus } from "@/lib/chordSources/consensus";
-import type { AnalyzeResult, ExternalSourceResult, SongGuess } from "@/lib/types";
+import type { AnalyzeDebug, AnalyzeResult, SongGuess } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -44,23 +45,33 @@ export async function POST(req: NextRequest) {
     songGuess = guessSong(videoTitle, video.channelName);
   }
 
-  // 3. 外部コード譜検索 (ChordWiki直接 + Web検索経由、並列・ベストエフォート)
-  let sources: ExternalSourceResult[] = [];
-  if (songGuess.title) {
-    const [wiki, web] = await Promise.all([
-      searchChordWiki(songGuess.title, songGuess.artist).catch(() => []),
-      searchWeb(songGuess.queries, songGuess.title, songGuess.artist).catch(() => []),
-    ]);
-    sources = [...wiki, ...web];
-  }
+  // 3. 外部コード譜の収集 (直接検索 + Web検索 + スコアリング)
+  const debug: AnalyzeDebug = {
+    songTitle: songGuess.title,
+    artist: songGuess.artist,
+    queries: songGuess.queries,
+    searches: [],
+    candidates: [],
+    fetched: [],
+    adopted: [],
+    keyCorrections: [],
+    elapsedMs: 0,
+  };
+  const searchStart = Date.now();
+  const sources = songGuess.title
+    ? await collectSources(songGuess, debug).catch(() => [])
+    : [];
+  debug.elapsedMs = Date.now() - searchStart;
 
-  // 4. 複数ソース照合 → 初期進行 (品質ゲート: 根拠が足りなければ空で返す)
-  let progression = buildConsensus(sources);
-  let found = progression.length >= 4;
+  // 4. 複数ソース照合 (移調・カポ補正込み) → 初期進行
+  let progression = buildConsensus(sources, debug);
+  const found = progression.length >= 4;
   if (!found) progression = [];
 
+  const disputedCount = progression.filter((p) => p.disputed).length;
   const message = found
-    ? `外部コード譜 ${sources.length} 件を参照して初期コード進行を生成しました。`
+    ? `外部コード譜 ${sources.length} 件を参照して初期コード進行を生成しました` +
+      (disputedCount > 0 ? `（ソース間不一致: ${disputedCount}コードは要確認）。` : "。")
     : "外部コード譜が見つかりませんでした。曲名・アーティスト名を修正して再検索するか、音源ファイルをアップロードして解析してください。";
 
   const result: AnalyzeResult = {
@@ -78,6 +89,7 @@ export async function POST(req: NextRequest) {
       chordCount: s.chords.length,
     })),
     message,
+    debug,
   };
 
   return NextResponse.json(result);

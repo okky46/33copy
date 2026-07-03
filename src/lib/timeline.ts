@@ -82,6 +82,9 @@ export function placeOnGrid(
   return slots.map((slot, i) => {
     const p = progression[i];
     const parsed = parseChord(p.name);
+    let confidence = confidenceFromEvidence(p.sourceCount, grid.source === "audio");
+    // 複数ソースがあるのに一致しなかったコードは信頼度を下げて要確認に
+    if (p.disputed) confidence = confidence === "high" ? "medium" : "low";
     return {
       id: newEventId(),
       name: p.name,
@@ -91,16 +94,52 @@ export function placeOnGrid(
       start: round3(slot.start),
       end: round3(slot.end),
       source: p.sourceCount > 1 ? ("merged" as const) : ("external" as const),
-      confidence: confidenceFromEvidence(p.sourceCount, grid.source === "audio"),
+      confidence,
       evidence: {
         externalSources: p.providers,
         timingConfidence,
+        notes: p.disputed ? ["外部ソース間で不一致"] : undefined,
       },
-      needsReview: false,
+      needsReview: !!p.disputed,
       edited: false,
       section: p.section,
     };
   });
+}
+
+/**
+ * BPM・最初の小節頭からグリッドを引き直す (手動調整用)。
+ * firstDownbeat より前は小節単位で0まで逆方向に外挿する。
+ */
+export function rebuildGrid(
+  bpm: number,
+  firstDownbeat: number,
+  duration: number,
+  source: BeatGrid["source"] = "assumed",
+  confidence = 0.5
+): BeatGrid | null {
+  if (bpm < 20 || bpm > 300 || duration <= 0) return null;
+  const beatSec = 60 / bpm;
+  const barSec = beatSec * 4;
+  // 小節頭を0以前まで逆算し、そこから拍を並べる
+  let start = firstDownbeat;
+  while (start - barSec >= -0.001) start -= barSec;
+  const beats: number[] = [];
+  const downbeats: number[] = [];
+  let i = 0;
+  for (let t = start; t <= duration + 1e-6; t += beatSec, i++) {
+    if (t < -0.001) continue;
+    beats.push(round3(Math.max(0, t)));
+    if (i % 4 === 0) downbeats.push(round3(Math.max(0, t)));
+  }
+  return {
+    bpm: Math.round(bpm * 10) / 10,
+    beats,
+    downbeats,
+    firstDownbeat: round3(Math.max(0, firstDownbeat)),
+    confidence,
+    source,
+  };
 }
 
 /** 外部ソース数とグリッド実測有無から信頼度を決める */

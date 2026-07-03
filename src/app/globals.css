@@ -307,10 +307,29 @@ html, body {
 .dot-left { background: var(--hl-left); }
 .dot-right { background: var(--hl-right); }
 
+/* デバッグ表示 */
+.debug-detail { font-size: 12px; }
+.debug-body {
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 14px; margin-top: 6px; max-height: 420px; overflow-y: auto;
+}
+.debug-body ul { margin: 4px 0 10px; padding-left: 18px; }
+.debug-body li { margin: 2px 0; word-break: break-all; }
+.debug-body code {
+  background: var(--bg-panel2); padding: 1px 5px; border-radius: 4px; font-size: 11px;
+}
+.debug-label { margin: 8px 0 2px; font-weight: 600; color: var(--muted); }
+.debug-rejected { opacity: 0.6; }
+.debug-err { color: var(--danger); }
+
 /* タイムライン */
 .timeline-actions { display: flex; gap: 12px; align-items: center; margin: 12px 0 6px; flex-wrap: wrap; }
-.snap-group, .shift-group { display: flex; align-items: center; gap: 4px; }
-.snap-group .label, .shift-group .label { min-width: auto; margin-right: 4px; }
+.snap-group, .shift-group, .grid-group { display: flex; align-items: center; gap: 4px; }
+.snap-group .label, .shift-group .label, .grid-group .label { min-width: auto; margin-right: 4px; }
+.bpm-input {
+  width: 72px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-panel2); color: var(--text);
+}
 .shortcut-hint { margin: 0 0 6px; }
 .timeline-outer { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
 .timeline-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
