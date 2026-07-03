@@ -11,8 +11,10 @@
 // - 振幅の対数圧縮 (log1p) でボーカルや打楽器の突出したピークの影響を弱める
 // - 時間方向のメディアンフィルタでドラム等の瞬間的な非調性成分を抑える
 //   (harmonic-percussive分離の簡易近似)
-// - 小節ではなく拍単位でコードを推定し、同じコードが続く区間だけをまとめる
-//   (半小節・1拍でコードが変わる曲でも追従できるようにする)
+// - 小節を基本単位としてコードを推定する (多くのJ-POPは1小節1コードで進行するため)。
+//   前半/後半で明確に異なるコードが鳴っている場合のみ半小節に分割する。
+//   拍単位まで細かく判定すると、ノイズによる誤検出で逆に精度が落ちるため、
+//   分割は「小節→半小節」の1段階のみに留める
 // - メジャー/マイナー3和音だけでなく7th/6th/sus/dim/augもテンプレートに含める
 
 import { FFT, hannWindow } from "./fft";
@@ -82,7 +84,7 @@ export async function analyzeAudio(
     source: "audio",
   };
 
-  const chords = detectChordsPerBeat(grid, frames, duration);
+  const chords = detectChordsPerBar(grid, frames, duration);
   opts.onProgress?.(1);
 
   return { grid, chords, duration };
@@ -479,6 +481,8 @@ interface ChordMatch {
   quality: string;
   tonePcs: number[];
   confidence: number;
+  /** テンプレート照合の生スコア (小節分割の判断に使う。0以下は非マッチ) */
+  score: number;
 }
 
 /**
@@ -530,25 +534,64 @@ function matchChord(chroma: Float32Array): ChordMatch | null {
     quality: best.template.quality,
     tonePcs,
     confidence,
+    score: best.score,
   };
 }
 
-interface BeatSlot {
+interface BarSeg {
   start: number;
   end: number;
   match: ChordMatch | null;
   bassChroma: Float32Array;
 }
 
+/** 半小節に分割してよいと判断するための最低スコアと、1小節扱いに対する優位マージン。
+ *  ノイズによる過剰な細分化を避けるため、明確に2つの異なるコードが鳴っている
+ *  場合だけ分割し、それ以外は1小節1コードとして扱う */
+const SPLIT_MIN_SCORE = 0.05;
+const SPLIT_RELATIVE_MARGIN = 1.0;
+const SPLIT_ABSOLUTE_MARGIN = 0.005;
+
+/** 区間 [a,b) のchroma/bassChroma/平均エネルギーを、フレームの中央値で集約する */
+function aggregateChroma(
+  frames: Frames,
+  frameAt: (sec: number) => number,
+  a: number,
+  b: number,
+  tmp: { buf: Float32Array }
+): { chroma: Float32Array; bass: Float32Array; energy: number } {
+  const f0 = frameAt(a);
+  const f1 = Math.max(f0 + 1, frameAt(b));
+  const len = f1 - f0;
+  if (len > tmp.buf.length) tmp.buf = new Float32Array(len);
+  const buf = tmp.buf;
+
+  // 合計ではなく中央値で集約する。突発的なノイズが1〜2フレームだけ混入しても
+  // (例: 打楽器のHPSS抑制漏れ)、合計だと結果を歪めるが中央値なら埋もれる
+  const chroma = new Float32Array(12);
+  const bass = new Float32Array(12);
+  for (let p = 0; p < 12; p++) {
+    for (let f = f0; f < f1; f++) buf[f - f0] = frames.chroma[f][p];
+    chroma[p] = medianOf(buf, len);
+    for (let f = f0; f < f1; f++) buf[f - f0] = frames.bassChroma[f][p];
+    bass[p] = medianOf(buf, len);
+  }
+  let energy = 0;
+  for (let f = f0; f < f1; f++) energy += frames.energy[f];
+  energy /= Math.max(1, len);
+  return { chroma, bass, energy };
+}
+
 /**
- * 小節ではなく拍単位でコードテンプレート照合を行い、同じコードが続く区間を
- * まとめてセグメント化する。半小節・1拍でコードが変わる曲にも追従できる。
- * 前後の拍が一致し当該拍だけ異なる場合は周囲に合わせる平滑化も行う
- * (単発の誤検出によるチラつきを抑える)。
+ * 小節を基本単位としてコードを推定する。多くのJ-POPは1小節1コードで進行するため、
+ * デフォルトは小節全体のchromaを1つのコードとして扱う。前半/後半で明確に異なる
+ * コードが鳴っている場合 (半小節でのコード変化) に限り、その小節だけ2分割する。
+ * 1拍単位までは分割しない — 過去に拍単位で判定した際、ノイズによる細切れの
+ * 誤検出が増えて逆に精度が落ちたため、分割は「小節→半小節」の1段階のみに留める。
  */
-function detectChordsPerBeat(grid: BeatGrid, frames: Frames, duration: number): AudioChordCandidate[] {
-  const beats = grid.beats;
-  if (beats.length < 2) return [];
+function detectChordsPerBar(grid: BeatGrid, frames: Frames, duration: number): AudioChordCandidate[] {
+  const bars = grid.downbeats;
+  if (bars.length < 1) return [];
   const frameAt = (sec: number) =>
     Math.max(
       0,
@@ -559,59 +602,59 @@ function detectChordsPerBeat(grid: BeatGrid, frames: Frames, duration: number): 
   let totalEnergy = 0;
   for (let f = 0; f < frames.energy.length; f++) totalEnergy += frames.energy[f];
   const avgEnergy = totalEnergy / Math.max(1, frames.energy.length);
+  const silent = (energy: number) => energy < avgEnergy * 0.05;
 
-  const slots: BeatSlot[] = [];
-  let tmp = new Float32Array(256); // フレーム数はビート長で決まるため通常はこれで足りる
-  for (let b = 0; b < beats.length; b++) {
-    const start = beats[b];
-    const end = b + 1 < beats.length ? beats[b + 1] : Math.min(duration, start + 60 / grid.bpm);
-    if (end <= start) continue;
-    const f0 = frameAt(start);
-    const f1 = Math.max(f0 + 1, frameAt(end));
-    const len = f1 - f0;
-    if (len > tmp.length) tmp = new Float32Array(len);
+  const tmp = { buf: new Float32Array(256) };
+  const segs: BarSeg[] = [];
 
-    // ビート内フレームを合計ではなく中央値で集約する。突発的なノイズが1〜2フレームだけ
-    // 混入しても (例: 打楽器のHPSS抑制漏れ)、合計だと結果を歪めるが中央値なら埋もれる
-    const ch = new Float32Array(12);
-    const bch = new Float32Array(12);
-    for (let p = 0; p < 12; p++) {
-      for (let f = f0; f < f1; f++) tmp[f - f0] = frames.chroma[f][p];
-      ch[p] = medianOf(tmp, len);
-      for (let f = f0; f < f1; f++) tmp[f - f0] = frames.bassChroma[f][p];
-      bch[p] = medianOf(tmp, len);
+  for (let b = 0; b < bars.length; b++) {
+    const start = bars[b];
+    const end = b + 1 < bars.length ? bars[b + 1] : Math.min(duration, start + (60 / grid.bpm) * 4);
+    if (end - start < 0.15) continue;
+
+    const whole = aggregateChroma(frames, frameAt, start, end, tmp);
+    if (silent(whole.energy)) continue;
+    const wholeMatch = matchChord(whole.chroma);
+
+    const mid = start + (end - start) / 2;
+    const first = aggregateChroma(frames, frameAt, start, mid, tmp);
+    const second = aggregateChroma(frames, frameAt, mid, end, tmp);
+    const firstMatch = silent(first.energy) ? null : matchChord(first.chroma);
+    const secondMatch = silent(second.energy) ? null : matchChord(second.chroma);
+
+    // 前半/後半が明確に異なるコードで、かつ分割した方が単一コード扱いより
+    // 明らかに当てはまりが良い場合だけ半小節に分割する
+    const splitScore = firstMatch && secondMatch ? (firstMatch.score + secondMatch.score) / 2 : -Infinity;
+    const shouldSplit =
+      firstMatch !== null &&
+      secondMatch !== null &&
+      firstMatch.name !== secondMatch.name &&
+      firstMatch.score > SPLIT_MIN_SCORE &&
+      secondMatch.score > SPLIT_MIN_SCORE &&
+      splitScore > (wholeMatch?.score ?? -Infinity) * SPLIT_RELATIVE_MARGIN + SPLIT_ABSOLUTE_MARGIN;
+
+    if (shouldSplit && firstMatch && secondMatch) {
+      segs.push({ start: round3(start), end: round3(mid), match: firstMatch, bassChroma: first.bass });
+      segs.push({ start: round3(mid), end: round3(end), match: secondMatch, bassChroma: second.bass });
+    } else if (wholeMatch) {
+      segs.push({ start: round3(start), end: round3(end), match: wholeMatch, bassChroma: whole.bass });
     }
-
-    let en = 0;
-    for (let f = f0; f < f1; f++) en += frames.energy[f];
-    en /= Math.max(1, len);
-    const match = en < avgEnergy * 0.05 ? null : matchChord(ch);
-    slots.push({ start: round3(start), end: round3(end), match, bassChroma: bch });
   }
-  if (slots.length === 0) return [];
+  if (segs.length === 0) return [];
 
-  // 平滑化: 前後の拍が一致し当該拍だけ違う場合は周囲に合わせる
-  const names = slots.map((s) => s.match?.name ?? null);
-  for (let i = 1; i < slots.length - 1; i++) {
-    const prev = names[i - 1], cur = names[i], next = names[i + 1];
-    if (cur !== null && prev !== null && next !== null && prev === next && cur !== prev) {
-      slots[i] = { ...slots[i], match: slots[i - 1].match };
-    }
-  }
-
-  // 連続する同一コードの拍をまとめてセグメント化 (ベース音はセグメント全体で集計)
+  // 連続する同一コードの区間をまとめてセグメント化 (ベース音は区間全体で集計)
   const result: AudioChordCandidate[] = [];
   let i = 0;
-  while (i < slots.length) {
-    const cur = slots[i];
+  while (i < segs.length) {
+    const cur = segs[i];
     if (!cur.match) {
       i++;
       continue;
     }
     let j = i + 1;
     const bassAcc = Float32Array.from(cur.bassChroma);
-    while (j < slots.length && slots[j].match?.name === cur.match.name) {
-      for (let p = 0; p < 12; p++) bassAcc[p] += slots[j].bassChroma[p];
+    while (j < segs.length && segs[j].match?.name === cur.match.name) {
+      for (let p = 0; p < 12; p++) bassAcc[p] += segs[j].bassChroma[p];
       j++;
     }
 
@@ -630,7 +673,7 @@ function detectChordsPerBeat(grid: BeatGrid, frames: Frames, duration: number): 
 
     result.push({
       start: cur.start,
-      end: slots[j - 1].end,
+      end: segs[j - 1].end,
       chord: name,
       root: PC_NAMES[cur.match.rootPc],
       quality: cur.match.quality,
