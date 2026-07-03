@@ -8,7 +8,7 @@ import {
   transposeChordName,
   CHORD_TOKEN_RE,
 } from "../src/lib/chords";
-import { buildQueries, guessSong, nameVariants } from "../src/lib/titleParse";
+import { buildQueries, cleanUserInput, guessSong, nameVariants } from "../src/lib/titleParse";
 import {
   chordIndexAt,
   makeAssumedGrid,
@@ -28,9 +28,10 @@ import {
 import { bestTransposition, buildConsensus } from "../src/lib/chordSources/consensus";
 import { scoreHit } from "../src/lib/chordSources/scoring";
 import { parseBingHtml, parseDuckDuckGoHtml } from "../src/lib/chordSources/webSearch";
+import { collectSources } from "../src/lib/chordSources/providers";
 import { analyzeAudio } from "../src/lib/audioAnalysis/analyze";
 import { extractVideoId } from "../src/lib/youtube";
-import type { AnalyzeResult } from "../src/lib/types";
+import type { AnalyzeDebug, AnalyzeResult } from "../src/lib/types";
 
 let passed = 0;
 let failed = 0;
@@ -85,6 +86,32 @@ ok(g1.queries.some((q) => q.includes("コード")), "queries include コード")
 
 const g2 = guessSong("Official髭男dism - Pretender［Official Video］", "Official髭男dism");
 eq(g2.title, "Pretender", "guessSong dash title");
+
+// 回帰テスト: アーティスト名の読み仮名注記・リリース情報がクエリに混入するバグ
+// (実際に「≠ME（ノットイコールミー）/ 3rd Single」がアーティスト名として
+//  誤抽出され、全検索クエリが壊れて0件になっていた)
+const g3 = guessSong(
+  "≠ME（ノットイコールミー）/ 3rd Single「チョコレートメランコリー」Music Video",
+  "≠ME（ノットイコールミー）"
+);
+eq(g3.title, "チョコレートメランコリー", "guessSong furigana+release title");
+eq(g3.artist, "≠ME", "guessSong furigana+release artist (no ふりがな/リリース情報混入)");
+ok(!g3.artist.includes("Single"), "artist does not contain release info");
+ok(!g3.artist.includes("ノットイコールミー"), "artist does not contain furigana");
+const g3Queries = buildQueries(g3.title, g3.artist);
+ok(g3Queries.every((q) => !q.includes("Single") && !q.includes("ノットイコールミー")), "queries are clean");
+
+// チャンネル名だけにふりがなが付くケース (区切りなしタイトル → チャンネル名がアーティストに)
+const g4 = guessSong("チョコレートメランコリー", "≠ME（ノットイコールミー）");
+eq(g4.artist, "≠ME", "channel-derived artist strips furigana");
+
+// リリース情報がタイトル側に残るケースも除去されること
+const g5 = guessSong("テスト曲 - テストアーティスト(2nd Single)", "テストアーティスト");
+ok(!g5.title.includes("Single") && !g5.artist.includes("Single"), "release info stripped from either side");
+
+// 手動オーバーライド (曲名修正フォーム) にペーストされたテキストも同様に浄化されること
+eq(cleanUserInput("≠ME（ノットイコールミー）/ 3rd Single"), "≠ME", "cleanUserInput strips furigana+release");
+eq(cleanUserInput("チョコレートメランコリー"), "チョコレートメランコリー", "cleanUserInput passthrough");
 
 // ---- videoId抽出 ----
 eq(extractVideoId("https://www.youtube.com/watch?v=x8VYWazR5mE"), "x8VYWazR5mE", "watch URL");
@@ -302,6 +329,82 @@ ok(bingHits.length === 2, `bing parse hits (${bingHits.length})`);
 eq(bingHits[0].url, "https://gakufu.gakki.me/m/data/N12345.html", "bing url extracted");
 ok(bingHits[0].snippet.includes("コード譜"), "bing snippet extracted");
 
+// ---- 検索パイプラインの耐性テスト (グローバルfetchをモックしてend-to-endで検証) ----
+// 実際に報告されたバグ: U-FRET/ChordWikiのリンク構造が想定と違う・
+// DuckDuckGo/Bingの専用パーサが0件、のケースでもフォールバック抽出で
+// 候補を拾えることを確認する。
+async function testSearchResilience() {
+  const chordPageHtml = (label: string) =>
+    `<html><head><title>チョコレートメランコリー / ≠ME ギターコード - ${label}</title></head><body>${[
+      "C", "G", "Am", "Em", "F", "C", "F", "G", "C", "G", "Am", "F",
+    ]
+      .map((c) => `<span class="chord">${c}</span>`)
+      .join(" ")}</body></html>`;
+
+  const calls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any) => {
+    const url = typeof input === "string" ? input : input.toString();
+    calls.push(url);
+    const html = (body: string, status = 200) =>
+      new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
+
+    // U-FRET: 検索結果はsong.php?data=形式ではなく新形式のパスを返す (フォールバック正規表現を試す)
+    if (url.includes("ufret.jp/search.php")) {
+      return html(`<a href="/song/999888">チョコレートメランコリー / ≠ME</a>`);
+    }
+    if (url.includes("ufret.jp/song/999888")) return html(chordPageHtml("U-FRET"));
+
+    // ChordWiki: t=パラメータではなくc=view形式のリンクを返す (広い正規表現を試す)
+    if (url.includes("chordwiki.org/wiki.cgi?c=search")) {
+      return html(`<a href="/wiki.cgi?c=view&p=%E3%83%86%E3%82%B9%E3%83%88">チョコレートメランコリー - ChordWiki</a>`);
+    }
+    if (url.includes("chordwiki.org/wiki.cgi?c=view")) return html(chordPageHtml("ChordWiki"));
+
+    // DuckDuckGo: 専用セレクタに一致しない壊れたマークアップ (汎用リンク抽出へのフォールバックを試す)
+    if (url.includes("duckduckgo.com")) {
+      return html(
+        `<html><body><a href="https://gakufu.gakki.me/m/data/N99999.html">チョコレートメランコリー コード - 楽器.me</a><a href="https://duckduckgo.com/about">About</a></body></html>`
+      );
+    }
+    if (url.includes("gakufu.gakki.me")) return html(chordPageHtml("楽器.me"));
+
+    // Bing: 同様に壊れたマークアップからのフォールバック
+    if (url.includes("bing.com")) {
+      return html(
+        `<html><body><a href="https://www.easter-egg.me/song/888">チョコレートメランコリー コード</a><a href="https://www.bing.com/privacy">Privacy</a></body></html>`
+      );
+    }
+    if (url.includes("easter-egg.me")) return html(chordPageHtml("easter-egg.me"));
+
+    return html("", 404);
+  }) as typeof fetch;
+
+  try {
+    const debug: AnalyzeDebug = {
+      songTitle: "チョコレートメランコリー", artist: "≠ME",
+      queries: ["チョコレートメランコリー ≠ME コード"],
+      searches: [], candidates: [], fetched: [], adopted: [], keyCorrections: [], elapsedMs: 0,
+    };
+    const sources = await collectSources(
+      { title: "チョコレートメランコリー", artist: "≠ME", confidence: 1, queries: debug.queries },
+      debug
+    );
+
+    ok(sources.length >= 3, `resilient search adopts sources despite broken markup (${sources.length})`);
+    const providers = sources.map((s) => s.provider);
+    ok(providers.some((p) => p.includes("ufret")), `U-FRET adopted via fallback regex (${providers.join(",")})`);
+    ok(providers.some((p) => p.includes("chordwiki")), "ChordWiki adopted via broadened regex");
+    const ddgSearch = debug.searches.find((s) => s.provider === "DuckDuckGo");
+    ok(!!ddgSearch?.usedFallback, "DuckDuckGo search marked as using generic fallback");
+    const bingSearch = debug.searches.find((s) => s.provider === "Bing");
+    ok(!!bingSearch?.usedFallback, "Bing search marked as using generic fallback");
+    ok(debug.fetched.some((f) => f.ok), "debug records at least one successful fetch");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
 // ---- 移調を考慮したコンセンサス ----
 const progA = ["C", "G", "Am", "Em", "F", "C", "F", "G", "C", "G", "Am", "F"];
 const srcOrig = {
@@ -401,12 +504,16 @@ async function testAudioAnalysis() {
   ok(audioOnly.timeline.every((e) => e.source === "audio-analysis"), "audio only -> source label");
 }
 
-testAudioAnalysis()
-  .catch((e) => {
+Promise.all([
+  testSearchResilience().catch((e) => {
+    failed++;
+    console.error("✗ search resilience threw:", e);
+  }),
+  testAudioAnalysis().catch((e) => {
     failed++;
     console.error("✗ audio analysis threw:", e);
-  })
-  .finally(() => {
-    console.log(`\n${passed} passed, ${failed} failed`);
-    if (failed > 0) process.exit(1);
-  });
+  }),
+]).finally(() => {
+  console.log(`\n${passed} passed, ${failed} failed`);
+  if (failed > 0) process.exit(1);
+});

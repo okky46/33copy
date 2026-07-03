@@ -106,7 +106,20 @@ export interface AnalyzeDebug {
   /** 実際に投げた検索クエリ */
   queries: string[];
   /** 検索プロバイダーごとの結果 */
-  searches: { provider: string; query: string; hitCount: number; error?: string }[];
+  searches: {
+    provider: string;
+    query: string;
+    hitCount: number;
+    error?: string;
+    /** HTTPステータスコード (取得できた場合) */
+    status?: number;
+    /** 応答本文のバイト数 (取得できた場合) */
+    bytes?: number;
+    /** CAPTCHA・アクセス拒否らしき応答だった可能性 */
+    blockedLike?: boolean;
+    /** 専用パーサが0件だったため汎用リンク抽出にフォールバックしたか */
+    usedFallback?: boolean;
+  }[];
   /** スコアリングした候補URL (採用/除外と理由) */
   candidates: { url: string; title: string; score: number; accepted: boolean; reasons: string[] }[];
   /** 取得・パースした結果 */

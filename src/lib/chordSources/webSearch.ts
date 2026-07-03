@@ -1,7 +1,11 @@
 // Web検索プロバイダー (DuckDuckGo HTML / Bing)
 // APIキー不要のHTMLエンドポイントをパースする。どちらかが失敗しても他方で継続する
+//
+// 検索サイトはHTML構造が変わりやすく、専用セレクタが0件になることがある。
+// その場合は「検索エンジン自身のドメインを除いた外部リンクを広く拾う」
+// フォールバック抽出を試み、構造変化に対してある程度耐性を持たせる。
 
-import { decodeEntities, fetchText } from "./fetchUtil";
+import { decodeEntities, fetchText, type FetchDiag } from "./fetchUtil";
 
 export interface SearchHit {
   url: string;
@@ -10,16 +14,52 @@ export interface SearchHit {
   searchProvider: string;
 }
 
+/** 検索実行1回分の診断情報 (デバッグ表示用) */
+export interface SearchDiag extends FetchDiag {
+  usedFallback?: boolean;
+}
+
 function stripTags(s: string): string {
   return decodeEntities(s.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
 }
 
+/** 検索エンジン自身のドメイン・広告/追跡リンクを除いた外部リンクを広く拾うフォールバック抽出 */
+function extractGenericLinks(html: string, excludeDomainRe: RegExp, provider: string): SearchHit[] {
+  const hits: SearchHit[] = [];
+  const re = /<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) && hits.length < 20) {
+    const url = decodeEntities(m[1]);
+    let domain = "";
+    try {
+      domain = new URL(url).hostname;
+    } catch {
+      continue;
+    }
+    if (excludeDomainRe.test(domain)) continue;
+    const title = stripTags(m[2]);
+    if (!title || title.length < 2) continue;
+    hits.push({ url, title, snippet: "", searchProvider: `${provider} (fallback)` });
+  }
+  return hits;
+}
+
+const DDG_OWN_DOMAIN_RE = /duckduckgo\.com$|duck\.co$/i;
+const BING_OWN_DOMAIN_RE = /bing\.com$|microsoft\.com$|msn\.com$|live\.com$/i;
+
 /** DuckDuckGo HTML版の検索結果をパースする (null = 取得失敗) */
-export async function searchDuckDuckGo(query: string): Promise<SearchHit[] | null> {
+export async function searchDuckDuckGo(
+  query: string,
+  diag?: SearchDiag
+): Promise<SearchHit[] | null> {
   const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=jp-jp`;
-  const html = await fetchText(url, 9000);
+  const html = await fetchText(url, 9000, diag);
   if (!html) return null;
-  return parseDuckDuckGoHtml(html);
+  const hits = parseDuckDuckGoHtml(html);
+  if (hits.length > 0) return hits;
+  const fallback = extractGenericLinks(html, DDG_OWN_DOMAIN_RE, "DuckDuckGo");
+  if (diag && fallback.length > 0) diag.usedFallback = true;
+  return fallback;
 }
 
 export function parseDuckDuckGoHtml(html: string): SearchHit[] {
@@ -58,11 +98,15 @@ export function parseDuckDuckGoHtml(html: string): SearchHit[] {
 }
 
 /** BingのHTML検索結果をパースする (null = 取得失敗) */
-export async function searchBing(query: string): Promise<SearchHit[] | null> {
+export async function searchBing(query: string, diag?: SearchDiag): Promise<SearchHit[] | null> {
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=ja&cc=jp`;
-  const html = await fetchText(url, 9000);
+  const html = await fetchText(url, 9000, diag);
   if (!html) return null;
-  return parseBingHtml(html);
+  const hits = parseBingHtml(html);
+  if (hits.length > 0) return hits;
+  const fallback = extractGenericLinks(html, BING_OWN_DOMAIN_RE, "Bing");
+  if (diag && fallback.length > 0) diag.usedFallback = true;
+  return fallback;
 }
 
 export function parseBingHtml(html: string): SearchHit[] {
@@ -90,7 +134,7 @@ export function parseBingHtml(html: string): SearchHit[] {
 
 export const SEARCH_ENGINES: {
   name: string;
-  run: (q: string) => Promise<SearchHit[] | null>;
+  run: (q: string, diag?: SearchDiag) => Promise<SearchHit[] | null>;
 }[] = [
   { name: "DuckDuckGo", run: searchDuckDuckGo },
   { name: "Bing", run: searchBing },
