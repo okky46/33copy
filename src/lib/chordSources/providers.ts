@@ -103,7 +103,7 @@ function extractLinksMatching(
   html: string,
   hrefRe: RegExp,
   resolveUrl: (raw: string) => string,
-  max = 6
+  max = 12
 ): { url: string; title: string }[] {
   const out: { url: string; title: string }[] = [];
   const seen = new Set<string>();
@@ -117,6 +117,36 @@ function extractLinksMatching(
     out.push({ url, title });
   }
   return out;
+}
+
+/**
+ * サイト内検索の結果リンクを「曲名・アーティスト名との一致度」で並べ替え、上位を返す。
+ * サイト内検索は関連する別の曲も返すことが多いため、リンクのアンカーテキストが
+ * 曲名・アーティストにどれだけ一致するかで絞り込み、目的の曲ページを優先的に取得する。
+ */
+function rankDirectHits(
+  links: { url: string; title: string }[],
+  song: string,
+  artist: string,
+  top = 3
+): { url: string; title: string }[] {
+  const ns = normalizeForMatch(song);
+  const na = normalizeForMatch(artist);
+  const scored = links.map((l) => {
+    const nt = normalizeForMatch(l.title);
+    let score = 0;
+    if (ns && nt.includes(ns)) score += 2;
+    else if (ns && ns.length >= 3 && nt.includes(ns.slice(0, Math.ceil(ns.length * 0.6)))) score += 0.7;
+    if (na && nt.includes(na)) score += 1;
+    return { l, score };
+  });
+  // 一致するものがあれば、一致したものだけを一致順に返す (無関係な別曲を弾く)。
+  // 一致が全く無ければ元の順 (サイトの関連度順) を尊重して上位を返す。
+  const anyMatch = scored.some((s) => s.score > 0);
+  if (anyMatch) {
+    return scored.filter((s) => s.score > 0).sort((a, b) => b.score - a.score).slice(0, top).map((s) => s.l);
+  }
+  return scored.slice(0, top).map((s) => s.l);
 }
 
 /** ChordWiki: サイト内検索 → 上位ページのURL候補 */
@@ -139,13 +169,44 @@ async function searchChordWikiDirect(
     /<a[^>]*href="(\/wiki\/[^"]+|\/wiki\.cgi\?[^"]+)"[^>]*>([\s\S]*?)<\/a>/,
     (raw) => `https://ja.chordwiki.org${raw}`
   ).filter((l) => !/c=search|c=edit|c=diff|c=new/.test(l.url));
-  const hits: SearchHit[] = links.map((l) => ({
+  const hits: SearchHit[] = rankDirectHits(links, song, artist).map((l) => ({
     url: l.url,
     title: l.title ? `${l.title} - ChordWiki` : "ChordWiki",
     snippet: "",
     searchProvider: "ChordWiki直接",
   }));
   pushSearchDebug(debug, "ChordWiki直接", q, hits.length, diag);
+  return hits;
+}
+
+/** 楽器.me (gakufu.gakki.me): サイト内検索 → 曲ページのURL候補 */
+async function searchGakufuDirect(
+  song: string,
+  artist: string,
+  debug: AnalyzeDebug
+): Promise<SearchHit[]> {
+  const q = `${song} ${artist}`.trim();
+  const searchUrl = `https://gakufu.gakki.me/search/?key=${encodeURIComponent(q)}`;
+  const diag: FetchDiag = { ok: false };
+  const html = await fetchText(searchUrl, 8000, diag);
+  if (!html) {
+    pushSearchDebug(debug, "楽器.me直接", q, 0, diag);
+    return [];
+  }
+  const resolve = (raw: string) => (raw.startsWith("http") ? raw : `https://gakufu.gakki.me${raw.startsWith("/") ? "" : "/"}${raw}`);
+  // 曲ページ: /m/data/N#####.html, /p/data/... など /<x>/data/ 配下
+  const links = extractLinksMatching(
+    html,
+    /<a[^>]*href="((?:https?:\/\/gakufu\.gakki\.me)?\/[a-z]\/data\/[^"]+\.html)"[^>]*>([\s\S]*?)<\/a>/i,
+    resolve
+  );
+  const hits: SearchHit[] = rankDirectHits(links, song, artist).map((l) => ({
+    url: l.url,
+    title: l.title ? `${l.title} - 楽器.me` : "楽器.me",
+    snippet: "",
+    searchProvider: "楽器.me直接",
+  }));
+  pushSearchDebug(debug, "楽器.me直接", q, hits.length, diag);
   return hits;
 }
 
@@ -178,7 +239,7 @@ async function searchUfretDirect(
       resolve
     ).filter((l) => !/search\.php|\/song\/?$/.test(l.url));
   }
-  const hits: SearchHit[] = links.map((l) => ({
+  const hits: SearchHit[] = rankDirectHits(links, song, artist).map((l) => ({
     url: l.url,
     title: l.title ? `${l.title} - U-FRET` : "U-FRET",
     snippet: "",
@@ -202,10 +263,11 @@ export async function collectSources(
   const started = Date.now();
   const deadline = () => Date.now() - started > SEARCH_DEADLINE_MS;
 
-  // --- 1. 検索 (直接 + Web検索エンジン) ---
+  // --- 1. 検索 (コードサイト直接検索を優先。Web検索が塞がれても直接検索で拾える) ---
   const allHits: SearchHit[] = [];
   const directResults = await Promise.all([
     searchUfretDirect(song, artist, debug).catch(() => []),
+    searchGakufuDirect(song, artist, debug).catch(() => []),
     searchChordWikiDirect(song, artist, debug).catch(() => []),
   ]);
   for (const hits of directResults) allHits.push(...hits);

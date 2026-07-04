@@ -74,6 +74,8 @@ export interface AudioAnalysisResult {
   grid: BeatGrid;
   chords: AudioChordCandidate[];
   duration: number;
+  /** 推定キー (音源解析でのみ得られる) */
+  key?: { tonicPc: number; mode: "major" | "minor"; confidence: number };
 }
 
 /** 曲名・アーティスト名の推定結果 */
@@ -213,6 +215,8 @@ export interface Project {
   audioChords?: AudioChordCandidate[];
   /** 解析した音源ファイル名 */
   audioFileName?: string;
+  /** 音源解析による推定キー */
+  estimatedKey?: { tonicPc: number; mode: "major" | "minor"; confidence: number } | null;
   /** 解析結果サマリー */
   analysis?: AnalysisSummary | null;
   /** 外部検索のデバッグ情報 (開発用表示) */
