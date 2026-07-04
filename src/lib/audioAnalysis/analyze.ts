@@ -69,11 +69,23 @@ export async function analyzeAudio(
   const frames = await computeFrames(samples, sampleRate, opts);
   opts.onProgress?.(0.85);
 
-  const { bpm, periodFrames, acfProminence } = estimateTempo(frames.novelty, frames.hopSec);
+  const tempo = estimateTempo(frames.novelty, frames.hopSec);
+  const acfProminence = tempo.acfProminence;
+  let bpm = tempo.bpm;
+  let periodFrames = tempo.periodFrames;
+  // テンポのオクターブ補正: 速すぎる推定 (>150BPM) は倍テンポを拾っている可能性が高い。
+  // その場合「1小節」が実質2拍になり、半小節分割が1拍刻みに見えてしまうため、
+  // 拍を1つおきに間引いて実テンポ帯 (75BPM相当) に寄せ、小節=4拍が音楽的な
+  // 1小節に対応するようにする。
+  if (bpm > 150) {
+    periodFrames *= 2;
+    bpm /= 2;
+  }
   const { beats, phaseContrast } = findBeats(frames, periodFrames, duration);
   const { downbeats, firstDownbeat } = findDownbeats(beats, frames);
   opts.onProgress?.(0.92);
 
+  const key = estimateKey(frames);
   const gridConfidence = clamp01(((phaseContrast - 1) * 1.6 + (acfProminence - 1.1) * 0.8) / 2);
   const grid: BeatGrid = {
     bpm: Math.round(bpm * 10) / 10,
@@ -84,10 +96,10 @@ export async function analyzeAudio(
     source: "audio",
   };
 
-  const chords = detectChordsPerBar(grid, frames, duration);
+  const chords = detectChordsPerBar(grid, frames, duration, key.bias);
   opts.onProgress?.(1);
 
-  return { grid, chords, duration };
+  return { grid, chords, duration, key: { tonicPc: key.tonicPc, mode: key.mode, confidence: round3(key.confidence) } };
 }
 
 /**
@@ -485,12 +497,121 @@ interface ChordMatch {
   score: number;
 }
 
+// ---- キー推定と調性バイアス ----
+
+/** Krumhansl-Kessler のキープロファイル (メジャー / マイナー) */
+const KK_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KK_MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+
+/** コード種別を大まかなクラスに分類する (調性判定用) */
+function qualityClass(quality: string): "maj" | "min" | "dim" | "aug" | "sus" {
+  if (quality === "m" || quality === "m7" || quality === "m6") return "min";
+  if (quality === "dim") return "dim";
+  if (quality === "aug") return "aug";
+  if (quality === "sus2" || quality === "sus4") return "sus";
+  return "maj"; // "", "7", "maj7", "6"
+}
+
+export interface KeyEstimate {
+  tonicPc: number;
+  mode: "major" | "minor";
+  confidence: number;
+  /** キーに対するコードの事前確率的な重み (-penalty..+bonus)。調性バイアスに使う */
+  bias: (rootPc: number, quality: string) => number;
+}
+
+/** ダイアトニック各度の期待コードクラス (トニックからの半音) */
+const MAJOR_DEGREE_CLASS: Record<number, "maj" | "min" | "dim"> = {
+  0: "maj", 2: "min", 4: "min", 5: "maj", 7: "maj", 9: "min", 11: "dim",
+};
+const MINOR_DEGREE_CLASS: Record<number, "maj" | "min" | "dim"> = {
+  0: "min", 2: "dim", 3: "maj", 5: "min", 7: "min", 8: "maj", 10: "maj", 11: "dim",
+};
+
+/** キーに対するコードの調性バイアスを作る。
+ *  ダイアトニックかつクラス一致で加点、スケール外で減点。
+ *  ハード除外はしない (強い証拠があれば借用和音・転調も採用できるようにする)。 */
+function makeKeyBias(tonicPc: number, mode: "major" | "minor"): (rootPc: number, quality: string) => number {
+  const degClass = mode === "major" ? MAJOR_DEGREE_CLASS : MINOR_DEGREE_CLASS;
+  // ダイアトニックで特に頻出のトニック/サブドミナント/ドミナントを厚めに
+  const strongDeg = mode === "major" ? new Set([0, 5, 7]) : new Set([0, 5, 7, 8]);
+  return (rootPc: number, quality: string) => {
+    const deg = ((rootPc - tonicPc) % 12 + 12) % 12;
+    const expected = degClass[deg];
+    const cls = qualityClass(quality);
+    if (cls === "sus") {
+      // sus は調性中立寄り。ルートがダイアトニックなら軽く許容
+      return expected !== undefined ? 0.01 : -0.03;
+    }
+    if (expected === undefined) {
+      // スケール外のルート → 明確に減点 (「変なコード」の抑制)
+      return -0.09;
+    }
+    if (cls === expected || (expected === "maj" && cls === "maj") || (expected === "min" && cls === "min")) {
+      return strongDeg.has(deg) ? 0.09 : 0.06;
+    }
+    // ルートはダイアトニックだがクラス不一致 (例: 期待minにmaj) → わずかに許容
+    return 0.0;
+  };
+}
+
+/** 全体のchromaからキーを推定する */
+function estimateKey(frames: Frames): KeyEstimate {
+  // エネルギー重み付きの全体chroma
+  const agg = new Float32Array(12);
+  for (let f = 0; f < frames.chroma.length; f++) {
+    const ch = frames.chroma[f];
+    for (let p = 0; p < 12; p++) agg[p] += ch[p];
+  }
+  const mean = agg.reduce((s, v) => s + v, 0) / 12;
+  const centered = agg.map((v) => v - mean);
+
+  const corr = (profile: number[], rot: number) => {
+    let pMean = 0;
+    for (let i = 0; i < 12; i++) pMean += profile[i];
+    pMean /= 12;
+    let num = 0, dp = 0, dc = 0;
+    for (let i = 0; i < 12; i++) {
+      const pv = profile[(i - rot + 12) % 12] - pMean;
+      num += pv * centered[i];
+      dp += pv * pv;
+      dc += centered[i] * centered[i];
+    }
+    return dp > 0 && dc > 0 ? num / Math.sqrt(dp * dc) : 0;
+  };
+
+  let best = { tonicPc: 0, mode: "major" as "major" | "minor", score: -Infinity };
+  let second = -Infinity;
+  for (let t = 0; t < 12; t++) {
+    for (const mode of ["major", "minor"] as const) {
+      const score = corr(mode === "major" ? KK_MAJOR : KK_MINOR, t);
+      if (score > best.score) {
+        second = best.score;
+        best = { tonicPc: t, mode, score };
+      } else if (score > second) {
+        second = score;
+      }
+    }
+  }
+  const confidence = clamp01((best.score - second) * 2 + best.score * 0.3);
+  return {
+    tonicPc: best.tonicPc,
+    mode: best.mode,
+    confidence,
+    bias: makeKeyBias(best.tonicPc, best.mode),
+  };
+}
+
 /**
  * 全12ルート×全テンプレートを照合し、最良のコードを返す。
  * テンプレートごとに音数が違う (3和音 vs 4和音) ため、合計ではなく平均で
  * スコアリングし、音数が多いテンプレートが不当に有利にならないようにする。
+ * keyBias が与えられた場合は、調性に沿ったコードを優遇 (スケール外を減点) する。
  */
-function matchChord(chroma: Float32Array): ChordMatch | null {
+function matchChord(
+  chroma: Float32Array,
+  keyBias?: (rootPc: number, quality: string) => number
+): ChordMatch | null {
   const n = norm(chroma);
   if (n === 0) return null;
   const c = new Float32Array(12);
@@ -513,7 +634,7 @@ function matchChord(chroma: Float32Array): ChordMatch | null {
         }
       }
       neg = negCount > 0 ? neg / negCount : 0;
-      const score = pos - neg * 0.45;
+      const score = pos - neg * 0.45 + (keyBias ? keyBias(root, tpl.quality) : 0);
       if (score > best.score) {
         second = best.score;
         best = { score, rootPc: root, template: tpl };
@@ -542,32 +663,29 @@ interface BarSeg {
   start: number;
   end: number;
   match: ChordMatch | null;
+  chroma: Float32Array;
   bassChroma: Float32Array;
 }
 
-/** 半小節に分割してよいと判断するための最低スコアと、1小節扱いに対する優位マージン。
- *  ノイズによる過剰な細分化を避けるため、明確に2つの異なるコードが鳴っている
- *  場合だけ分割し、それ以外は1小節1コードとして扱う */
+/** 半小節に分割してよいと判断する条件。基本は1小節1コードとし、
+ *  前半/後半のchromaが実際に大きく異なり (SPLIT_MIN_DIST)、かつ分割した方が
+ *  1小節扱いより十分に当てはまりが良い (SPLIT_SCORE_MARGIN) 場合だけ2分割する。
+ *  拍単位では絶対に分割しない (最小単位は半小節=2拍)。 */
 const SPLIT_MIN_SCORE = 0.05;
-const SPLIT_RELATIVE_MARGIN = 1.0;
-const SPLIT_ABSOLUTE_MARGIN = 0.005;
+const SPLIT_SCORE_MARGIN = 0.04;
+const SPLIT_MIN_DIST = 0.18;
 
-/** 区間 [a,b) のchroma/bassChroma/平均エネルギーを、フレームの中央値で集約する */
-function aggregateChroma(
+/** フレーム区間 [f0,f1) を中央値で集約する。合計ではなく中央値にすることで、
+ *  突発的なノイズフレームが1〜2個混入しても結果が歪まない。 */
+function aggregateFrames(
   frames: Frames,
-  frameAt: (sec: number) => number,
-  a: number,
-  b: number,
+  f0: number,
+  f1: number,
   tmp: { buf: Float32Array }
 ): { chroma: Float32Array; bass: Float32Array; energy: number } {
-  const f0 = frameAt(a);
-  const f1 = Math.max(f0 + 1, frameAt(b));
-  const len = f1 - f0;
+  const len = Math.max(1, f1 - f0);
   if (len > tmp.buf.length) tmp.buf = new Float32Array(len);
   const buf = tmp.buf;
-
-  // 合計ではなく中央値で集約する。突発的なノイズが1〜2フレームだけ混入しても
-  // (例: 打楽器のHPSS抑制漏れ)、合計だと結果を歪めるが中央値なら埋もれる
   const chroma = new Float32Array(12);
   const bass = new Float32Array(12);
   for (let p = 0; p < 12; p++) {
@@ -578,18 +696,34 @@ function aggregateChroma(
   }
   let energy = 0;
   for (let f = f0; f < f1; f++) energy += frames.energy[f];
-  energy /= Math.max(1, len);
+  energy /= len;
   return { chroma, bass, energy };
+}
+
+/** 2つのchromaベクトルのコサイン距離 (0=同じ, 1=直交) */
+function cosineDistance(a: Float32Array, b: Float32Array): number {
+  const na = norm(a), nb = norm(b);
+  if (na === 0 || nb === 0) return 1;
+  let dot = 0;
+  for (let i = 0; i < 12; i++) dot += a[i] * b[i];
+  return 1 - dot / (na * nb);
 }
 
 /**
  * 小節を基本単位としてコードを推定する。多くのJ-POPは1小節1コードで進行するため、
- * デフォルトは小節全体のchromaを1つのコードとして扱う。前半/後半で明確に異なる
- * コードが鳴っている場合 (半小節でのコード変化) に限り、その小節だけ2分割する。
- * 1拍単位までは分割しない — 過去に拍単位で判定した際、ノイズによる細切れの
- * 誤検出が増えて逆に精度が落ちたため、分割は「小節→半小節」の1段階のみに留める。
+ * デフォルトは小節全体のchromaを1つのコードとして扱う。前半/後半のchromaが実際に
+ * 大きく異なる場合 (2拍ずつ2コード) に限り、その小節だけ半小節に分割する。
+ * 拍単位には決して分割しない (最小単位は半小節=2拍)。
+ *
+ * さらに、推定キーに沿った調性バイアスで「変なコード」を抑え、隣接小節との
+ * 平滑化で孤立した外れコードを周囲に合わせる。
  */
-function detectChordsPerBar(grid: BeatGrid, frames: Frames, duration: number): AudioChordCandidate[] {
+function detectChordsPerBar(
+  grid: BeatGrid,
+  frames: Frames,
+  duration: number,
+  keyBias?: (rootPc: number, quality: string) => number
+): AudioChordCandidate[] {
   const bars = grid.downbeats;
   if (bars.length < 1) return [];
   const frameAt = (sec: number) =>
@@ -612,18 +746,21 @@ function detectChordsPerBar(grid: BeatGrid, frames: Frames, duration: number): A
     const end = b + 1 < bars.length ? bars[b + 1] : Math.min(duration, start + (60 / grid.bpm) * 4);
     if (end - start < 0.15) continue;
 
-    const whole = aggregateChroma(frames, frameAt, start, end, tmp);
+    const bf0 = frameAt(start);
+    const bf1 = Math.max(bf0 + 1, frameAt(end));
+    const whole = aggregateFrames(frames, bf0, bf1, tmp);
     if (silent(whole.energy)) continue;
-    const wholeMatch = matchChord(whole.chroma);
+    const wholeMatch = matchChord(whole.chroma, keyBias);
 
-    const mid = start + (end - start) / 2;
-    const first = aggregateChroma(frames, frameAt, start, mid, tmp);
-    const second = aggregateChroma(frames, frameAt, mid, end, tmp);
-    const firstMatch = silent(first.energy) ? null : matchChord(first.chroma);
-    const secondMatch = silent(second.energy) ? null : matchChord(second.chroma);
+    const midF = Math.max(bf0 + 1, Math.min(bf1 - 1, frameAt(start + (end - start) / 2)));
+    const first = aggregateFrames(frames, bf0, midF, tmp);
+    const second = aggregateFrames(frames, midF, bf1, tmp);
+    const firstMatch = silent(first.energy) ? null : matchChord(first.chroma, keyBias);
+    const secondMatch = silent(second.energy) ? null : matchChord(second.chroma, keyBias);
 
-    // 前半/後半が明確に異なるコードで、かつ分割した方が単一コード扱いより
-    // 明らかに当てはまりが良い場合だけ半小節に分割する
+    // 前半/後半が「別のコード」かつ chroma 自体が実際に大きく異なり、
+    // 分割した方が1小節扱いより十分に当てはまりが良い場合だけ2分割する
+    const halfDist = cosineDistance(first.chroma, second.chroma);
     const splitScore = firstMatch && secondMatch ? (firstMatch.score + secondMatch.score) / 2 : -Infinity;
     const shouldSplit =
       firstMatch !== null &&
@@ -631,16 +768,32 @@ function detectChordsPerBar(grid: BeatGrid, frames: Frames, duration: number): A
       firstMatch.name !== secondMatch.name &&
       firstMatch.score > SPLIT_MIN_SCORE &&
       secondMatch.score > SPLIT_MIN_SCORE &&
-      splitScore > (wholeMatch?.score ?? -Infinity) * SPLIT_RELATIVE_MARGIN + SPLIT_ABSOLUTE_MARGIN;
+      halfDist > SPLIT_MIN_DIST &&
+      splitScore > (wholeMatch?.score ?? -Infinity) + SPLIT_SCORE_MARGIN;
 
+    const mid = round3(start + (end - start) / 2);
     if (shouldSplit && firstMatch && secondMatch) {
-      segs.push({ start: round3(start), end: round3(mid), match: firstMatch, bassChroma: first.bass });
-      segs.push({ start: round3(mid), end: round3(end), match: secondMatch, bassChroma: second.bass });
+      segs.push({ start: round3(start), end: mid, match: firstMatch, chroma: first.chroma, bassChroma: first.bass });
+      segs.push({ start: mid, end: round3(end), match: secondMatch, chroma: second.chroma, bassChroma: second.bass });
     } else if (wholeMatch) {
-      segs.push({ start: round3(start), end: round3(end), match: wholeMatch, bassChroma: whole.bass });
+      segs.push({ start: round3(start), end: round3(end), match: wholeMatch, chroma: whole.chroma, bassChroma: whole.bass });
     }
   }
   if (segs.length === 0) return [];
+
+  // 平滑化: 前後の区間が同じコードで自分だけ違う孤立した外れ小節を周囲に合わせる。
+  // ただし自分のコードが周囲より明確に強い (score差が大きい) 場合は残す。
+  for (let i = 1; i < segs.length - 1; i++) {
+    const prev = segs[i - 1].match, cur = segs[i].match, next = segs[i + 1].match;
+    if (!prev || !cur || !next) continue;
+    if (prev.name === next.name && cur.name !== prev.name) {
+      // 周囲のコードを自分のchromaで採点し直し、大差なければ周囲に合わせる
+      const neighborScore = scoreChordOn(segs[i].chroma, prev, keyBias);
+      if (cur.score - neighborScore < 0.06) {
+        segs[i] = { ...segs[i], match: { ...prev, confidence: prev.confidence * 0.9 } };
+      }
+    }
+  }
 
   // 連続する同一コードの区間をまとめてセグメント化 (ベース音は区間全体で集計)
   const result: AudioChordCandidate[] = [];
@@ -683,6 +836,29 @@ function detectChordsPerBar(grid: BeatGrid, frames: Frames, duration: number): A
     i = j;
   }
   return result;
+}
+
+/** 既知コード match を chroma に対して採点する (平滑化での近傍比較用) */
+function scoreChordOn(
+  chroma: Float32Array,
+  match: ChordMatch,
+  keyBias?: (rootPc: number, quality: string) => number
+): number {
+  const n = norm(chroma);
+  if (n === 0) return -Infinity;
+  const c = new Float32Array(12);
+  for (let i = 0; i < 12; i++) c[i] = chroma[i] / n;
+  const tones = match.tonePcs;
+  const tpl = CHORD_TEMPLATES.find((t) => t.quality === match.quality) ?? CHORD_TEMPLATES[0];
+  let pos = 0;
+  for (let i = 0; i < tones.length; i++) pos += c[tones[i]] * (tpl.weights[i] ?? 0.7);
+  pos /= tones.length;
+  let neg = 0, negCount = 0;
+  for (let p = 0; p < 12; p++) {
+    if (!tones.includes(p)) { neg += c[p]; negCount++; }
+  }
+  neg = negCount > 0 ? neg / negCount : 0;
+  return pos - neg * 0.45 + (keyBias ? keyBias(match.rootPc, match.quality) : 0);
 }
 
 function argmax(v: Float32Array): number {

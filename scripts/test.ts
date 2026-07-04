@@ -349,11 +349,16 @@ async function testSearchResilience() {
     const html = (body: string, status = 200) =>
       new Response(body, { status, headers: { "content-type": "text/html; charset=utf-8" } });
 
-    // U-FRET: 検索結果はsong.php?data=形式ではなく新形式のパスを返す (フォールバック正規表現を試す)
+    // U-FRET: 検索結果はsong.php?data=形式ではなく新形式のパスを返す (フォールバック正規表現を試す)。
+    // 別曲も混ぜて、タイトル一致で正しい曲ページが選ばれること (rankDirectHits) を検証する
     if (url.includes("ufret.jp/search.php")) {
-      return html(`<a href="/song/999888">チョコレートメランコリー / ≠ME</a>`);
+      return html(
+        `<a href="/song/111000">別のぜんぜん違う曲 / 別アーティスト</a>` +
+          `<a href="/song/999888">チョコレートメランコリー / ≠ME</a>`
+      );
     }
     if (url.includes("ufret.jp/song/999888")) return html(chordPageHtml("U-FRET"));
+    if (url.includes("ufret.jp/song/111000")) return html(chordPageHtml("別曲")); // 選ばれないはず
 
     // ChordWiki: t=パラメータではなくc=view形式のリンクを返す (広い正規表現を試す)
     if (url.includes("chordwiki.org/wiki.cgi?c=search")) {
@@ -361,13 +366,19 @@ async function testSearchResilience() {
     }
     if (url.includes("chordwiki.org/wiki.cgi?c=view")) return html(chordPageHtml("ChordWiki"));
 
+    // 楽器.me: サイト内検索 → /m/data/ の曲ページリンク
+    if (url.includes("gakufu.gakki.me/search")) {
+      return html(`<a href="/m/data/N99999.html">チョコレートメランコリー / ≠ME - 楽器.me</a>`);
+    }
+    if (url.includes("gakufu.gakki.me/m/data/")) return html(chordPageHtml("楽器.me"));
+
     // DuckDuckGo: 専用セレクタに一致しない壊れたマークアップ (汎用リンク抽出へのフォールバックを試す)
     if (url.includes("duckduckgo.com")) {
       return html(
-        `<html><body><a href="https://gakufu.gakki.me/m/data/N99999.html">チョコレートメランコリー コード - 楽器.me</a><a href="https://duckduckgo.com/about">About</a></body></html>`
+        `<html><body><a href="https://www.chordbook.jp/song/777">チョコレートメランコリー コード</a><a href="https://duckduckgo.com/about">About</a></body></html>`
       );
     }
-    if (url.includes("gakufu.gakki.me")) return html(chordPageHtml("楽器.me"));
+    if (url.includes("chordbook.jp")) return html(chordPageHtml("chordbook"));
 
     // Bing: 同様に壊れたマークアップからのフォールバック
     if (url.includes("bing.com")) {
@@ -395,6 +406,10 @@ async function testSearchResilience() {
     const providers = sources.map((s) => s.provider);
     ok(providers.some((p) => p.includes("ufret")), `U-FRET adopted via fallback regex (${providers.join(",")})`);
     ok(providers.some((p) => p.includes("chordwiki")), "ChordWiki adopted via broadened regex");
+    ok(providers.some((p) => p.includes("gakki")), `楽器.me direct search adopted (${providers.join(",")})`);
+    // rankDirectHits: U-FRETの検索結果に別曲が混ざっていても、曲名一致で正しい曲ページを採用する
+    ok(debug.adopted.some((u) => u.includes("999888")), "correct U-FRET song page picked by title match");
+    ok(!debug.adopted.some((u) => u.includes("111000")), "unrelated U-FRET song page not picked");
     const ddgSearch = debug.searches.find((s) => s.provider === "DuckDuckGo");
     ok(!!ddgSearch?.usedFallback, "DuckDuckGo search marked as using generic fallback");
     const bingSearch = debug.searches.find((s) => s.provider === "Bing");
@@ -627,12 +642,14 @@ const CHORD_FREQS: Record<string, number[]> = {
   G: [98.0, 123.47, 146.83, 196.0],
   Am: [110.0, 130.81, 164.81, 220.0],
   F: [174.61, 220.0, 261.63, 349.23],
+  Dm: [146.83, 174.61, 220.0, 293.66], // D F A — Cメジャーのii、Cと構成音を共有しない
 };
 const CHORD_ROOT: Record<string, { root: string; minor: boolean }> = {
   C: { root: "C", minor: false },
   G: { root: "G", minor: false },
   Am: { root: "A", minor: true },
   F: { root: "F", minor: false },
+  Dm: { root: "D", minor: true },
 };
 
 async function testRealisticAudioConditions() {
@@ -640,19 +657,21 @@ async function testRealisticAudioConditions() {
   const bpm = 120;
   const totalSec = 24;
 
-  // ---- 半小節 (2拍) ごとにコードが変わる曲でも、明確な場合は追従できること ----
-  // デフォルトは1小節1コードだが、前半/後半が明確に異なる場合のみ半小節に分割する。
+  // ---- 各小節が「2拍ずつ2コード」で、両半が明確に異なる場合は半小節に分割できること ----
+  // デフォルトは1小節1コードだが、前半/後半が構成音を共有せず明確に異なる場合は分割する。
+  // 各小節を C(前半) + Dm(後半) の固定パターンにして小節境界と半小節変化を揃える。
+  // (C と Dm は構成音を共有せず、まとめると不協和なので分割が正当化される)
   // 拍・小節グリッドの位相推定には一定のズレが乗りうる (「小節頭を現在に合わせる」で
   // 補正できる別の関心事) ため、採点は位相ズレに頑健な方法で行う
   {
-    const sequence = ["C", "G", "Am", "F"];
-    const segSec = 1.0; // 120BPMの2拍 = 半小節
-    const nameAt = (t: number) => sequence[Math.floor(t / segSec) % sequence.length];
+    const barSec = 2.0;
+    const halfPattern = ["C", "Dm"]; // 各小節 = C(0-1拍) → Dm(2-3拍)
+    const nameAt = (t: number) => halfPattern[Math.floor((t % barSec) / (barSec / 2))];
     const samples = synthChordSignal({ sr, bpm, totalSec, chordAt: (t) => CHORD_FREQS[nameAt(t)] });
     const result = await analyzeAudio(samples, sr);
-    const acc = gradeAccuracyBestPhase(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec, segSec);
-    ok(acc >= 0.7, `half-bar chord changes tracked (accuracy ${(acc * 100).toFixed(0)}%)`);
-    ok(result.chords.length >= 6, `half-bar changes produce multiple segments, not one giant bar (${result.chords.length})`);
+    const acc = gradeAccuracyBestPhase(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec, barSec / 2);
+    ok(acc >= 0.7, `half-bar (2 chords/bar) changes tracked (accuracy ${(acc * 100).toFixed(0)}%)`);
+    ok(result.chords.length >= 12, `distinct half-bar chords do split, not one chord per bar (${result.chords.length})`);
   }
 
   // ---- 1小節1コードの曲では過剰に細分化されないこと (今回の主目的) ----
@@ -698,7 +717,32 @@ async function testRealisticAudioConditions() {
     const acc = gradeAccuracy(result.chords, (t) => CHORD_ROOT[nameAt(t)], totalSec, 0.15);
     ok(acc >= 0.6, `chord root survives interfering melody (accuracy ${(acc * 100).toFixed(0)}%)`);
   }
+
+  // ---- キー推定と、調性バイアスによる「変なコード」抑制 ----
+  // Cメジャーのダイアトニック進行 C-Am-F-G を、小節頭に広帯域ノイズを乗せて解析。
+  // キーがCメジャーと推定され、スケール外の妙なコードが混入しないことを確認する
+  {
+    const sequence = ["C", "Am", "F", "G"];
+    const barSec = 2.0;
+    const nameAt = (t: number) => sequence[Math.floor(t / barSec) % sequence.length];
+    let seed = 1;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+    const base = synthChordSignal({ sr, bpm, totalSec, chordAt: (t) => CHORD_FREQS[nameAt(t)] });
+    for (let i = 0; i < base.length; i++) {
+      const t = i / sr;
+      if (t % barSec < 0.08) base[i] += (rnd() * 2 - 1) * 0.5; // 小節頭に打楽器的ノイズ
+    }
+    const result = await analyzeAudio(base, sr);
+    ok(!!result.key && result.key.tonicPc === 0 && result.key.mode === "major", `key estimated as C major (${result.key ? PC_NAMES_T[result.key.tonicPc] + " " + result.key.mode : "none"})`);
+    const inKey = new Set([0, 2, 4, 5, 7, 9, 11]); // Cメジャースケール
+    const pcIdx: Record<string, number> = { C: 0, "C#": 1, D: 2, "D#": 3, E: 4, F: 5, "F#": 6, G: 7, "G#": 8, A: 9, "A#": 10, B: 11 };
+    const outOfKey = result.chords.filter((c) => !inKey.has(pcIdx[c.root ?? "C"] ?? 0));
+    ok(outOfKey.length === 0, `no out-of-key chords leak in (${outOfKey.map((c) => c.chord).join(",")})`);
+    ok(result.chords.length <= 20, `diatonic progression not over-fragmented (${result.chords.length} segments)`);
+  }
 }
+
+const PC_NAMES_T = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 Promise.all([
   testSearchResilience().catch((e) => {

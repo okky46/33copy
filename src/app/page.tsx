@@ -41,6 +41,11 @@ const ANALYZE_STEPS = [
 
 const PLAYER_CONTAINER_ID = "yt-player-container";
 
+const KEY_PC_NAMES = ["C", "C#", "D", "E♭", "E", "F", "F#", "G", "A♭", "A", "B♭", "B"];
+function formatKey(key: { tonicPc: number; mode: "major" | "minor" }): string {
+  return `${KEY_PC_NAMES[key.tonicPc] ?? "?"} ${key.mode === "major" ? "メジャー" : "マイナー"}`;
+}
+
 export default function Home() {
   const [urlInput, setUrlInput] = useState("");
   const [analyzeStep, setAnalyzeStep] = useState(-1); // -1 = 解析中でない
@@ -261,6 +266,7 @@ export default function Home() {
               beatGrid: result.grid,
               audioChords: result.chords,
               audioFileName: file.name,
+              estimatedKey: result.key ?? null,
               analysis: {
                 sourceCount: p.sources.length,
                 bpm: result.grid.bpm,
@@ -285,6 +291,7 @@ export default function Home() {
             beatGrid: out.grid,
             audioChords: result.chords,
             audioFileName: file.name,
+            estimatedKey: result.key ?? null,
             analysis: out.summary,
           };
         });
@@ -646,6 +653,9 @@ export default function Home() {
                       拍グリッド: {formatTime(project.beatGrid.firstDownbeat)} から
                     </span>
                   </>
+                )}
+                {project.estimatedKey && (
+                  <span className="stat-chip">推定キー: {formatKey(project.estimatedKey)}</span>
                 )}
                 {timeline.length > 0 && (
                   <span className="stat-chip">タイミング信頼度: {project.analysis.timingConfidence}</span>
